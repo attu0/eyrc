@@ -49,5 +49,9 @@ setup(
     maintainer_email='support@e-yantra.org',
     description='Your Task solutions.',
     license='Apache-2.0',
-    scripts=SCRIPTS,
+    scripts=[
+        'scripts/task1a/task1A.py',
+        'scripts/task1b/task1B.py',
+        'scripts/task1c/task1C.py',
+    ],
 )
