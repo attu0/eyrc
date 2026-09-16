@@ -18,14 +18,14 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ 1449 ]
+# Team ID:          [ 1499 ]
 # Author List:		[ Atharv, Abhay, Riddhi, Yash ]
 # Filename:		    task1A.py
 # Functions:
-#			        [ Comma separated list of functions in this file ]
+# [ Comma separated list of functions in this file ]
 # Nodes:		    Add your publishing and subscribing node
 #                   Example:
-#			        Publishing Topics  - [ /tf ]
+# Publishing Topics  - [ /tf ]
 #                   Subscribing Topics - [ /camera/camera/color/image_raw, /etc... ]
 
 
@@ -56,18 +56,6 @@ camera_info_topic = '/camera/camera/color/camera_info'
 # The parent frame every ore transform is published against.
 base_frame = 'base_link'
 
-# HSV Ranges
-HSV_RANGES = {
-    'azurite_ore': {'lower': np.array([95, 180, 149]), 'upper': np.array([115, 255, 230])}, #blue
-    'malachite_ore': {'lower': np.array([68, 200, 220]), 'upper': np.array([80, 255, 255])}, #green
-    'vanadinite_ore': {'lower': np.array([5, 220, 220]), 'upper': np.array([15, 255, 255])}, #Orange
-}
-
-
-MIN_CONTOUR_AREA = 80          # px^2 — drop noise blobs smaller than this
-DEPTH_PATCH_HALF = 4           # px — take the median of a (2*DEPTH_PATCH_HALF+1)^2 patch to get depth
-
-ORE_HALF_HEIGHT = 0.02
 
 ##################### FUNCTION DEFINITIONS #######################
 
@@ -92,41 +80,38 @@ def detect_ores(image):
     ore_type_list = []
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    kernel = np.ones((5, 5), np.uint8)
 
-    ############ ADD YOUR CODE HERE ############
+    color_bounds = {
+        'azurite_ore': ((95, 150, 100), (115, 255, 255)),
+        'malachite_ore': ((60, 150, 100), (90, 255, 255)),
+        'vanadinite_ore': ((0, 200, 180), (20, 255, 255)),
+    }
 
-    for ore_type, (lower, upper) in HSV_RANGES.items():
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    for ore_type, (lower, upper) in color_bounds.items():
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < MIN_CONTOUR_AREA:
+        for c in contours:
+            if cv2.contourArea(c) < 150:  # tune this threshold
                 continue
-
-            M = cv2.moments(contour)
+            M = cv2.moments(c)
             if M['m00'] == 0:
                 continue
-
             cX = int(M['m10'] / M['m00'])
             cY = int(M['m01'] / M['m00'])
-
             center_ore_list.append((cX, cY))
             ore_type_list.append(ore_type)
 
-            # Draw for the required submission screenshot
-            x, y, w, h = cv2.boundingRect(contour)
-            cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 255), 2)
-            cv2.circle(image, (cX, cY), 3, (0, 0, 255), -1)
+    return center_ore_list, ore_type_list
 
+    ############ ADD YOUR CODE HERE ############
 
     # INSTRUCTIONS & HELP :
 
-    #	->  Detect the ores by COLOUR, and return a center pixel and a type for each.
+    # ->  Detect the ores by COLOUR, and return a center pixel and a type for each.
     #       ->  HINT: hsv  = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     #                 mask = cv2.inRange(hsv, lower, upper)       # one pair per type
     #                 H is 0-179, S and V are 0-255. The frame is BGR, not RGB.
@@ -170,31 +155,40 @@ class ore_tf(Node):
 
         self.color_cam_sub = self.create_subscription(Image, color_topic, self.colorimagecb, 10)
         self.depth_cam_sub = self.create_subscription(Image, depth_topic, self.depthimagecb, 10)
-        self.cam_info_sub = self.create_subscription(CameraInfo, camera_info_topic, self.caminfocb, 10)
+        self.cam_info_sub = self.create_subscription(
+            CameraInfo, camera_info_topic, self.caminfocb, 10)
 
         ############ Constructor VARIABLES/OBJECTS ############
 
-        image_processing_rate = 0.2                                                     # rate of time to process image (seconds)
-        self.bridge = CvBridge()                                                        # initialise CvBridge object for image conversion
-        self.tf_buffer = tf2_ros.buffer.Buffer()                                        # buffer time used for listening transforms
+        # rate of time to process image (seconds)
+        image_processing_rate = 0.2
+        # initialise CvBridge object for image conversion
+        self.bridge = CvBridge()
+        # buffer time used for listening transforms
+        self.tf_buffer = tf2_ros.buffer.Buffer()
         self.listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.br = tf2_ros.TransformBroadcaster(self)                                    # object as transform broadcaster to send transform wrt some frame_id
-        self.timer = self.create_timer(image_processing_rate, self.process_image)       # creating a timer based function which gets called on every 0.2 seconds (as defined by 'image_processing_rate' variable)
+        # object as transform broadcaster to send transform wrt some frame_id
+        self.br = tf2_ros.TransformBroadcaster(self)
+        # creating a timer based function which gets called on every 0.2 seconds
+        # (as defined by 'image_processing_rate' variable)
+        self.timer = self.create_timer(image_processing_rate, self.process_image)
 
-        self.cv_image = None                                                            # colour raw image variable (from colorimagecb())
-        self.depth_image = None                                                         # depth image variable (from depthimagecb())
-        self.cam_info = None                                                            # camera intrinsics variable (from caminfocb())
+        # colour raw image variable (from colorimagecb())
+        self.cv_image = None
+        # depth image variable (from depthimagecb())
+        self.depth_image = None
+        # camera intrinsics variable (from caminfocb())
+        self.cam_info = None
 
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
 
-        #	->  Add any variable your detection needs to keep between frames.
+        # ->  Add any variable your detection needs to keep between frames.
         #       ->  HINT: The two ores of a type must keep their ids for the whole run, and
         #                 'detect_ores' returns them unordered.
 
         ############################################
-
 
     def depthimagecb(self, data):
         '''
@@ -207,11 +201,25 @@ class ore_tf(Node):
         Returns:
         '''
 
+        try:
+            depth = self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
+
+            if not hasattr(self, '_logged_depth_dtype'):
+                self.get_logger().info(f'Depth dtype: {depth.dtype}')
+                self._logged_depth_dtype = True
+
+            if depth.dtype == np.uint16:
+                depth = depth.astype(np.float32) / 1000.0  # mm -> m
+
+            self.depth_image = depth
+        except CvBridgeError as e:
+            self.get_logger().error(f'Depth image conversion failed: {e}')
+
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
 
-        #	->  Convert the ROS Image message to a CV2 image and store it.
+        # ->  Convert the ROS Image message to a CV2 image and store it.
         #       ->  HINT: self.bridge.imgmsg_to_cv2(data, desired_encoding='passthrough')
 
         #   ->  Get the units right. Print 'depth.dtype'.
@@ -221,7 +229,6 @@ class ore_tf(Node):
         #       ->  HINT: depth[np.isfinite(depth) & (depth > 0.0)]
 
         ############################################
-
 
     def colorimagecb(self, data):
         '''
@@ -233,16 +240,19 @@ class ore_tf(Node):
 
         Returns:
         '''
+        try:
+            self.cv_image = self.bridge.imgmsg_to_cv2(data, desired_encoding='bgr8')
+        except CvBridgeError as e:
+            self.get_logger().error(f'Color image conversion failed: {e}')
 
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
 
-        #	->  Convert the ROS Image message to a CV2 image and store it.
+        # ->  Convert the ROS Image message to a CV2 image and store it.
         #       ->  HINT: self.bridge.imgmsg_to_cv2(data, desired_encoding='bgr8')
 
         ############################################
-
 
     def caminfocb(self, data):
         '''
@@ -255,17 +265,22 @@ class ore_tf(Node):
         Returns:
         '''
 
+        self.cam_info = data.k
+        self.fx = data.k[0]
+        self.fy = data.k[4]
+        self.cx = data.k[2]
+        self.cy = data.k[5]
+
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
 
-        #	->  Store the focal lengths and the principal point. Read them from the topic;
+        # ->  Store the focal lengths and the principal point. Read them from the topic;
         #       never hard-code them.
         #       ->  HINT: 'k' is the pinhole matrix flattened row by row-
         #                     k = [fx, 0, cx, 0, fy, cy, 0, 0, 1]
 
         ############################################
-
 
     def process_image(self):
         '''
@@ -276,11 +291,42 @@ class ore_tf(Node):
         Returns:
         '''
 
+        if self.cv_image is None:
+            self.get_logger().info('Waiting for color image...')
+            return
+
+        if not hasattr(self, '_saved_frame'):
+            ok = cv2.imwrite('/home/atharv/eyrc_ws/frame.png', self.cv_image)
+            self._saved_frame = True
+            self.get_logger().info(f'Save attempt result: {ok}')
+
+        display = self.cv_image.copy()
+        center_ore_list, ore_type_list = detect_ores(self.cv_image)
+
+        self.get_logger().info(f'Detected {len(center_ore_list)} ores: {ore_type_list}')
+
+        for (cX, cY), ore_type in zip(center_ore_list, ore_type_list):
+            cv2.circle(display, (cX, cY), 8, (255, 255, 255), 2)
+            cv2.putText(display, ore_type, (cX - 30, cY - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        cv2.imshow('color_feed', display)
+        cv2.waitKey(1)
+
+        if self.depth_image is not None and hasattr(self, 'fx'):
+            if not hasattr(self, '_logged_intrinsics'):
+                self.get_logger().info(f'fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}')
+                self.get_logger().info(
+                    f'depth shape={
+                        self.depth_image.shape}, dtype={
+                        self.depth_image.dtype}')
+                self._logged_intrinsics = True
+
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
 
-        #	->  Return early until both images and the camera info have arrived.
+        # ->  Return early until both images and the camera info have arrived.
 
         #   ->  Get the ore centers and their types from 'detect_ores' defined above
 
@@ -340,9 +386,11 @@ def main():
 
     node.get_logger().info('Node created: Ore tf process')          # logging information
 
-    ore_tf_class = ore_tf()                                         # creating a new object for class 'ore_tf'
+    # creating a new object for class 'ore_tf'
+    ore_tf_class = ore_tf()
 
-    rclpy.spin(ore_tf_class)                                        # spining on the object to make it alive in ROS 2 DDS
+    # spining on the object to make it alive in ROS 2 DDS
+    rclpy.spin(ore_tf_class)
 
     ore_tf_class.destroy_node()                                     # destroy node after spin ends
 
