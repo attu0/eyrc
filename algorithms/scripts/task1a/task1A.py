@@ -18,7 +18,7 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ 1499 ]
+# Team ID:          [ 1449 ]
 # Author List:		[ Atharv, Abhay, Riddhi, Yash ]
 # Filename:		    task1A.py
 # Functions:
@@ -41,7 +41,8 @@ from rclpy.node import Node
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import CameraInfo, Image
-
+from geometry_msgs.msg import TransformStamped, PointStamped
+from tf2_geometry_msgs import do_transform_point
 
 ##################### TASK CONSTANTS #######################
 
@@ -180,6 +181,8 @@ class ore_tf(Node):
         # camera intrinsics variable (from caminfocb())
         self.cam_info = None
 
+        self.ore_positions = {}
+
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
@@ -303,8 +306,6 @@ class ore_tf(Node):
         display = self.cv_image.copy()
         center_ore_list, ore_type_list = detect_ores(self.cv_image)
 
-        self.get_logger().info(f'Detected {len(center_ore_list)} ores: {ore_type_list}')
-
         for (cX, cY), ore_type in zip(center_ore_list, ore_type_list):
             cv2.circle(display, (cX, cY), 8, (255, 255, 255), 2)
             cv2.putText(display, ore_type, (cX - 30, cY - 15),
@@ -314,14 +315,153 @@ class ore_tf(Node):
         cv2.waitKey(1)
 
         if self.depth_image is not None and hasattr(self, 'fx'):
-            if not hasattr(self, '_logged_intrinsics'):
-                self.get_logger().info(f'fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}')
-                self.get_logger().info(
-                    f'depth shape={
-                        self.depth_image.shape}, dtype={
-                        self.depth_image.dtype}')
-                self._logged_intrinsics = True
+            cam_frame_id = 'camera_color_optical_frame'
+            now = self.get_clock().now().to_msg()
 
+            by_type = {}
+            for (cX, cY), ore_type in zip(center_ore_list, ore_type_list):
+                by_type.setdefault(ore_type, []).append((cX, cY))
+
+            for ore_type, dets in by_type.items():
+                candidate_ids = [f'{ore_type}_1', f'{ore_type}_2']
+
+                if len(dets) == 1:
+                    (cX, cY) = dets[0]
+                    best_id, best_dist = None, float('inf')
+                    for oid in candidate_ids:
+                        if oid in self.ore_positions:
+                            px, py = self.ore_positions[oid]
+                            dist = (px - cX) ** 2 + (py - cY) ** 2
+                            if dist < best_dist:
+                                best_dist, best_id = dist, oid
+                    if best_id is None:
+                        best_id = candidate_ids[0]
+                    assignment = [(best_id, (cX, cY))]
+
+                elif len(dets) >= 2:
+                    d1, d2 = dets[0], dets[1]
+                    known = [oid for oid in candidate_ids if oid in self.ore_positions]
+
+                    if len(known) == 2:
+                        id1, id2 = candidate_ids
+                        p1, p2 = self.ore_positions[id1], self.ore_positions[id2]
+                        cost_a = (p1[0] - d1[0])**2 + (p1[1] - d1[1])**2 + \
+                            (p2[0] - d2[0])**2 + (p2[1] - d2[1])**2
+                        cost_b = (p2[0] - d1[0])**2 + (p2[1] - d1[1])**2 + \
+                            (p1[0] - d2[0])**2 + (p1[1] - d2[1])**2
+                        assignment = [
+                            (id1, d1), (id2, d2)] if cost_a <= cost_b else [
+                            (id2, d1), (id1, d2)]
+                    elif len(known) == 1:
+                        known_id = known[0]
+                        other_id = candidate_ids[1] if known_id == candidate_ids[0] else candidate_ids[0]
+                        p = self.ore_positions[known_id]
+                        dist1 = (p[0] - d1[0])**2 + (p[1] - d1[1])**2
+                        dist2 = (p[0] - d2[0])**2 + (p[1] - d2[1])**2
+                        assignment = [
+                            (known_id, d1), (other_id, d2)] if dist1 <= dist2 else [
+                            (known_id, d2), (other_id, d1)]
+                    else:
+                        assignment = [(candidate_ids[0], d1), (candidate_ids[1], d2)]
+                else:
+                    assignment = []
+
+                for best_id, (cX, cY) in assignment:
+                    patch = self.depth_image[max(cY - 4, 0):cY + 5, max(cX - 4, 0):cX + 5]
+                    valid = patch[np.isfinite(patch) & (patch > 0.0)]
+                    if valid.size == 0:
+                        continue
+                    z = float(np.median(valid))
+                    x = (cX - self.cx) * z / self.fx
+                    y = (cY - self.cy) * z / self.fy
+
+                    point_in_camera = PointStamped()
+                    point_in_camera.header.frame_id = cam_frame_id
+                    point_in_camera.header.stamp = rclpy.time.Time().to_msg()
+                    point_in_camera.point.x = x
+                    point_in_camera.point.y = y
+                    point_in_camera.point.z = z
+
+                    try:
+                        tf = self.tf_buffer.lookup_transform(
+                            base_frame, cam_frame_id, rclpy.time.Time())
+                        point_in_base = do_transform_point(point_in_camera, tf)
+                    except Exception as e:
+                        self.get_logger().warn(f'TF lookup failed for {best_id}: {e}')
+                        continue
+
+                    bx, by, bz = point_in_base.point.x, point_in_base.point.y, point_in_base.point.z
+                    self.ore_positions[best_id] = (cX, cY)
+
+                    t = TransformStamped()
+                    t.header.stamp = now
+                    t.header.frame_id = base_frame
+                    t.child_frame_id = best_id
+                    t.transform.translation.x = float(bx)
+                    t.transform.translation.y = float(by)
+                    t.transform.translation.z = float(bz)
+                    t.transform.rotation.w = 1.0
+                    self.br.sendTransform(t)
+                    cam_frame_id = 'camera_color_optical_frame'
+                    now = self.get_clock().now().to_msg()
+
+                    for (cX, cY), ore_type in zip(center_ore_list, ore_type_list):
+                        patch = self.depth_image[max(cY - 4, 0):cY + 5, max(cX - 4, 0):cX + 5]
+                        valid = patch[np.isfinite(patch) & (patch > 0.0)]
+                        if valid.size == 0:
+                            continue
+                        z = float(np.median(valid))
+                        x = (cX - self.cx) * z / self.fx
+                        y = (cY - self.cy) * z / self.fy
+
+                        point_in_camera = PointStamped()
+                        point_in_camera.header.frame_id = cam_frame_id
+                        point_in_camera.header.stamp = rclpy.time.Time().to_msg()
+                        point_in_camera.point.x = x
+                        point_in_camera.point.y = y
+                        point_in_camera.point.z = z
+
+                        try:
+                            tf = self.tf_buffer.lookup_transform(
+                                base_frame, cam_frame_id, rclpy.time.Time())
+                            point_in_base = do_transform_point(point_in_camera, tf)
+                        except Exception as e:
+                            self.get_logger().warn(f'TF lookup failed for {ore_type}: {e}')
+                            continue
+
+                        bx, by, bz = point_in_base.point.x, point_in_base.point.y, point_in_base.point.z
+
+                        candidate_ids = [f'{ore_type}_1', f'{ore_type}_2']
+                        best_id = None
+                        best_dist = float('inf')
+                        for oid in candidate_ids:
+                            if oid in self.ore_positions:
+                                px, py = self.ore_positions[oid]
+                                dist = (px - cX) ** 2 + (py - cY) ** 2
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    best_id = oid
+
+                        if best_id is None or best_dist > 10000:
+                            for oid in candidate_ids:
+                                if oid not in self.ore_positions:
+                                    best_id = oid
+                                    break
+
+                        if best_id is None:
+                            continue
+
+                        self.ore_positions[best_id] = (cX, cY)
+
+                        t = TransformStamped()
+                        t.header.stamp = now
+                        t.header.frame_id = base_frame
+                        t.child_frame_id = best_id
+                        t.transform.translation.x = float(bx)
+                        t.transform.translation.y = float(by)
+                        t.transform.translation.z = float(bz)
+                        t.transform.rotation.w = 1.0
+                        self.br.sendTransform(t)
         ############ ADD YOUR CODE HERE ############
 
         # INSTRUCTIONS & HELP :
