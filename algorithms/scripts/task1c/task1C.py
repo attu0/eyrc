@@ -1,313 +1,560 @@
 #!/usr/bin/env python3
 
-
-'''
-*****************************************************************************************
-*
-*        		===============================================
-*           		        StrataCobot (SC) Theme (eYRC 2026-27)
-*        		===============================================
-*
-*  This script should be used to implement Task 1B of StrataCobot (SC) Theme (eYRC 2026-27).
-*
-*  This software is made available on an "AS IS WHERE IS BASIS".
-*  Licensee/end user indemnifies and will keep e-Yantra indemnified from
-*  any and all claim(s) that emanate from the use of the Software or
-*  breach of the terms of this agreement.
-*
-*****************************************************************************************
-'''
-
-# Team ID:          [ Team-ID ]
-# Author List:		[ Names of team members worked on this file separated by Comma: Name1, Name2, ... ]
-# Filename:		    task1b_boilerplate.py
-# Functions:
-#			        [ Comma separated list of functions in this file ]
-# Nodes:		    Add your publishing and subscribing node
-#                   Example:
-#			        Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
-#                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /etc... ]
-
-
-################### IMPORT MODULES #######################
-
 import rclpy
 import sys
 import math
+
 from rclpy.node import Node
-from control_msgs.msg import JointJog
-from controller_manager_msgs.srv import SwitchController
-from geometry_msgs.msg import PoseStamped, TwistStamped
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Int32
+from rclpy.qos import (
+    QoSProfile,
+    QoSDurabilityPolicy,
+    QoSReliabilityPolicy,
+    QoSHistoryPolicy,
+    qos_profile_sensor_data
+)
+
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry, Path
+from sensor_msgs.msg import LaserScan
 
 
-##################### TASK CONSTANTS #######################
+path_topic = '/ebot_path'
+odom_topic = '/odom'
+scan_topic = '/scan'
+cmd_topic = '/cmd_vel'
 
-# Tool positions in base_link, in metres, in the order they must be reached. The tool
-# stops at each one and holds it for at least two seconds. Copy the signs as they are:
-# base_link is the UR7e's own frame, not the Gazebo world's.
-waypoints = [
-    (-0.4085, -0.5379, 0.1967),   # 1
-    (-0.8000, -0.0005, 0.3967),   # 2
-    (-0.7430,  0.5280, 0.1967),   # 3
-    (-0.4097,  0.5280, 0.1967),   # 4
-    (-0.0763,  0.5280, 0.1967),   # 5
-]
-
-# The two command interfaces. Only ONE is active at a time; messages to the other are
-# accepted and ignored.
-servo_ns = '/ur_arm_controller'
-twist_controller = 'delta_twist_controller'
-joint_controller = 'delta_joint_controller'
-
-# The only frame a twist may be stamped with; any other is refused, not converted. Note
-# 'base' is base_link turned through 180 degrees, not another name for it.
-base_frame = 'base_link'
-
-# JointJog velocities are matched to these names, in this order.
-joint_names = [
-    'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-    'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
-]
-
-# What the servo accepts. A command above one of these is dropped WHOLE, not clamped.
-cap_linear_mps = 0.15     # magnitude of a twist's linear part
-cap_angular_rps = 0.35    # magnitude of its angular part
-cap_joint_rps = 0.35      # per joint
-
-# Dead-man switch: the arm stops this long after the last message it received.
-command_timeout_s = 0.15
+max_linear_mps = 0.5
+max_angular_rps = 1.0
 
 
-##################### CLASS DEFINITION #######################
-
-class arm_waypoints(Node):
-    '''
-    ___CLASS___
-
-    Description:    Class which serves the purpose to drive the UR7e's tool through the
-                    given waypoints using the arm's velocity command interfaces.
-    '''
+class ebot_nav(Node):
 
     def __init__(self):
-        '''
-        Description:    Initialization of class arm_waypoints
-        '''
 
-        # use_sim_time is set here, not on the command line, so this node runs on the
-        # simulation clock however it is started.
-        super().__init__(                                                               # registering node
-            'arm_waypoints_node',
-            parameter_overrides=[rclpy.parameter.Parameter(
-                'use_sim_time', rclpy.Parameter.Type.BOOL, True)])
+        super().__init__(
+            'ebot_nav_node',
+            parameter_overrides=[
+                rclpy.parameter.Parameter(
+                    'use_sim_time',
+                    rclpy.Parameter.Type.BOOL,
+                    True
+                )
+            ]
+        )
 
-        ############ Topic PUBLISHERS ############
+        # ============================================================
+        # PATH QoS
+        # /ebot_path is latched / TRANSIENT_LOCAL
+        # ============================================================
 
-        self.twist_pub = self.create_publisher(TwistStamped, '/delta_twist_cmds', 10)    # end-effector velocity, in base_link
-        self.joint_pub = self.create_publisher(JointJog, '/delta_joint_cmds', 10)        # per-joint velocity
+        path_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
 
-        ############ Topic SUBSCRIPTIONS ############
+        self.path_sub = self.create_subscription(
+            Path,
+            path_topic,
+            self.pathcb,
+            path_qos
+        )
 
-        self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
-        self.joint_sub = self.create_subscription(JointState, '/joint_states', self.jointstatecb, 50)
-        self.status_sub = self.create_subscription(Int32, '/arm_status', self.armstatuscb, 10)
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            odom_topic,
+            self.odomcb,
+            10
+        )
 
-        ############ Constructor VARIABLES/OBJECTS ############
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            scan_topic,
+            self.scancb,
+            qos_profile_sensor_data
+        )
 
-        control_rate = 0.05                                                             # rate of time to run one control cycle (seconds)
-        self.switch_cli = self.create_client(                                           # client used to pick which command topic is live
-            SwitchController, f'{servo_ns}/switch_controller')
-        self.timer = self.create_timer(control_rate, self.process_waypoints)            # creating a timer based function which gets called on every 0.05 seconds (as defined by 'control_rate' variable)
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            cmd_topic,
+            10
+        )
 
-        self.tcp_pose = None                                                            # tool pose variable (from tcpposecb())
-        self.joint_angles = None                                                        # joint feedback variable (from jointstatecb())
-        self.arm_status = None                                                          # arm state code variable (from armstatuscb())
+        # 20 Hz
+        self.timer = self.create_timer(
+            0.05,
+            self.process_navigation
+        )
 
-        ############ ADD YOUR CODE HERE ############
+        # ============================================================
+        # STATE
+        # ============================================================
 
-        # INSTRUCTIONS & HELP :
+        self.route = None
+        self.odom = None
+        self.scan = None
 
-        #	->  Add any variable your motion needs to keep between cycles.
-        #       ->  HINT: Which waypoint you are on, and what the arm is doing about it.
+        self.current_waypoint = 0
 
-        ############################################
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+
+        self.finished = False
+
+        # Obstacle avoidance
+        self.avoid_direction = 0.0
+        self.avoiding = False
+
+        self.get_logger().info("eBot navigation node started")
+
+    # ================================================================
+    # PATH CALLBACK
+    # ================================================================
+
+    def pathcb(self, data):
+
+        try:
+
+            if self.route is not None:
+                return
+
+            if len(data.poses) == 0:
+                self.get_logger().warn("Received empty path")
+                return
+
+            self.route = []
+
+            for pose in data.poses:
+
+                x = pose.pose.position.x
+                y = pose.pose.position.y
+
+                self.route.append((x, y))
+
+            self.current_waypoint = 0
+
+            self.get_logger().info(
+                f"Received route with {len(self.route)} waypoints "
+                f"in frame '{data.header.frame_id}'"
+            )
+
+            for i, point in enumerate(self.route):
+
+                self.get_logger().info(
+                    f"Waypoint {i + 1}: "
+                    f"x={point[0]:.3f}, y={point[1]:.3f}"
+                )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f"Path callback error: {e}"
+            )
+
+    # ================================================================
+    # ODOM CALLBACK
+    # ================================================================
+
+    def odomcb(self, data):
+
+        try:
+
+            self.odom = data
+
+            p = data.pose.pose.position
+            q = data.pose.pose.orientation
+
+            self.x = p.x
+            self.y = p.y
+
+            # Quaternion -> yaw
+            siny_cosp = 2.0 * (
+                q.w * q.z +
+                q.x * q.y
+            )
+
+            cosy_cosp = 1.0 - 2.0 * (
+                q.y * q.y +
+                q.z * q.z
+            )
+
+            self.yaw = math.atan2(
+                siny_cosp,
+                cosy_cosp
+            )
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f"Odometry callback error: {e}"
+            )
+
+    # ================================================================
+    # LASER CALLBACK
+    # ================================================================
+
+    def scancb(self, data):
+
+        try:
+            self.scan = data
+
+        except Exception as e:
+
+            self.get_logger().error(
+                f"Scan callback error: {e}"
+            )
+
+    # ================================================================
+    # ANGLE WRAP
+    # ================================================================
+
+    def wrap_angle(self, angle):
+
+        return math.atan2(
+            math.sin(angle),
+            math.cos(angle)
+        )
+
+    # ================================================================
+    # LASER SECTOR
+    # ================================================================
+
+    def get_sector_distance(self, start_angle, end_angle):
+
+        if self.scan is None:
+            return float('inf')
+
+        values = []
+
+        angle = self.scan.angle_min
+
+        for r in self.scan.ranges:
+
+            if (
+                math.isfinite(r)
+                and self.scan.range_min <= r <= self.scan.range_max
+            ):
+
+                # Normalize angle
+                a = self.wrap_angle(angle)
+
+                # Sector crossing -PI/PI
+                if start_angle <= end_angle:
+
+                    if start_angle <= a <= end_angle:
+                        values.append(r)
+
+                else:
+
+                    if a >= start_angle or a <= end_angle:
+                        values.append(r)
+
+            angle += self.scan.angle_increment
+
+        if not values:
+            return float('inf')
+
+        return min(values)
+
+    # ================================================================
+    # MAIN NAVIGATION
+    # ================================================================
+
+    def process_navigation(self):
+
+        try:
+
+            # --------------------------------------------------------
+            # Wait for all required data
+            # --------------------------------------------------------
+
+            if self.route is None:
+                return
+
+            if self.odom is None:
+                return
+
+            if self.scan is None:
+                return
+
+            # --------------------------------------------------------
+            # Route completed
+            # --------------------------------------------------------
+
+            if self.finished:
+
+                self.stop_robot()
+                return
+
+            # --------------------------------------------------------
+            # Check waypoint index
+            # --------------------------------------------------------
+
+            if self.current_waypoint >= len(self.route):
+
+                self.finished = True
+                self.stop_robot()
+
+                self.get_logger().info(
+                    "All waypoints completed!"
+                )
+
+                return
+
+            # --------------------------------------------------------
+            # Current target
+            # --------------------------------------------------------
+
+            tx, ty = self.route[self.current_waypoint]
+
+            dx = tx - self.x
+            dy = ty - self.y
+
+            distance = math.hypot(dx, dy)
+
+            # --------------------------------------------------------
+            # Waypoint reached
+            # --------------------------------------------------------
+
+            if distance <= 0.30:
+
+                self.get_logger().info(
+                    f"Reached waypoint "
+                    f"{self.current_waypoint + 1}"
+                )
+
+                self.current_waypoint += 1
+
+                if self.current_waypoint >= len(self.route):
+
+                    self.finished = True
+                    self.stop_robot()
+
+                    self.get_logger().info(
+                        "FINAL WAYPOINT REACHED"
+                    )
+
+                return
+
+            # --------------------------------------------------------
+            # Heading error
+            # --------------------------------------------------------
+
+            target_angle = math.atan2(dy, dx)
+
+            heading_error = self.wrap_angle(
+                target_angle - self.yaw
+            )
+
+            # ========================================================
+            # OBSTACLE DETECTION
+            # ========================================================
+
+            # Front: approximately +/- 25 degrees
+            front = self.get_sector_distance(
+                math.radians(-25),
+                math.radians(25)
+            )
+
+            # Left: 25 to 70 degrees
+            left = self.get_sector_distance(
+                math.radians(25),
+                math.radians(70)
+            )
+
+            # Right: -70 to -25 degrees
+            right = self.get_sector_distance(
+                math.radians(-70),
+                math.radians(-25)
+            )
+
+            # ========================================================
+            # OBSTACLE AVOIDANCE
+            # ========================================================
+
+            obstacle_distance = 0.65
+
+            if front < obstacle_distance:
+
+                self.avoiding = True
+
+                # Choose side having more free space
+                if left > right:
+
+                    self.avoid_direction = 1.0
+
+                else:
+
+                    self.avoid_direction = -1.0
+
+            # --------------------------------------------------------
+            # Avoid obstacle
+            # --------------------------------------------------------
+
+            if self.avoiding:
+
+                # If front is clear again, return to waypoint tracking
+                if front > 0.85:
+
+                    self.avoiding = False
+
+                else:
+
+                    msg = Twist()
+
+                    # Turn toward free side
+                    msg.angular.z = (
+                        self.avoid_direction *
+                        0.75
+                    )
+
+                    # Move slowly while turning
+                    msg.linear.x = 0.08
+
+                    self.limit_cmd(msg)
+
+                    self.cmd_pub.publish(msg)
+
+                    return
+
+            # ========================================================
+            # NORMAL WAYPOINT FOLLOWING
+            # ========================================================
+
+            # Proportional angular controller
+            Kp_angular = 1.8
+
+            angular = Kp_angular * heading_error
+
+            # Limit angular velocity
+            angular = max(
+                -max_angular_rps,
+                min(max_angular_rps, angular)
+            )
+
+            # --------------------------------------------------------
+            # Slow down while turning
+            # --------------------------------------------------------
+
+            heading_abs = abs(heading_error)
+
+            if heading_abs > math.radians(60):
+
+                linear = 0.05
+
+            elif heading_abs > math.radians(35):
+
+                linear = 0.12
+
+            elif heading_abs > math.radians(15):
+
+                linear = 0.22
+
+            else:
+
+                linear = 0.38
+
+            # --------------------------------------------------------
+            # Slow down near waypoint
+            # --------------------------------------------------------
+
+            if distance < 0.5:
+
+                linear = min(
+                    linear,
+                    0.15
+                )
+
+            # --------------------------------------------------------
+            # Extra obstacle precaution
+            # --------------------------------------------------------
+
+            if front < 1.0:
+
+                linear = min(
+                    linear,
+                    0.12
+                )
+
+            # --------------------------------------------------------
+            # Publish command
+            # --------------------------------------------------------
+
+            msg = Twist()
+
+            msg.linear.x = linear
+            msg.angular.z = angular
+
+            self.limit_cmd(msg)
+
+            self.cmd_pub.publish(msg)
+
+        except Exception as e:
+
+            # Never allow controller exception to kill node
+            self.get_logger().error(
+                f"Navigation error: {e}"
+            )
+
+            self.stop_robot()
+
+    # ================================================================
+    # LIMIT COMMAND
+    # ================================================================
+
+    def limit_cmd(self, msg):
+
+        msg.linear.x = max(
+            -max_linear_mps,
+            min(max_linear_mps, msg.linear.x)
+        )
+
+        msg.angular.z = max(
+            -max_angular_rps,
+            min(max_angular_rps, msg.angular.z)
+        )
+
+    # ================================================================
+    # STOP
+    # ================================================================
+
+    def stop_robot(self):
+
+        msg = Twist()
+
+        msg.linear.x = 0.0
+        msg.angular.z = 0.0
+
+        self.cmd_pub.publish(msg)
 
 
-    def tcpposecb(self, data):
-        '''
-        Description:    Callback function for the tool pose topic.
-                        Use this function to receive where the tool currently is.
-
-        Args:
-            data (PoseStamped):    Pose of the tool, reported in base_link
-
-        Returns:
-        '''
-
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the tool's position and orientation.
-        #       ->  HINT: data.pose.position, data.pose.orientation
-
-        ############################################
-
-
-    def jointstatecb(self, data):
-        '''
-        Description:    Callback function for the joint states topic.
-                        Use this function to receive the current angle of each joint.
-
-        Args:
-            data (JointState):    Joint feedback published by the arm
-
-        Returns:
-        '''
-
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the joint angles, matched BY NAME - the order is not promised.
-        #       ->  HINT: angles = [data.position[data.name.index(j)] for j in joint_names]
-        #       ->  NOTE: A joint assumed to be at zero when it is not reads as a large
-        #                 error, and a controller acting on it drives hard towards it.
-
-        ############################################
-
-
-    def armstatuscb(self, data):
-        '''
-        Description:    Callback function for the arm status topic.
-                        Use this function to receive the arm's current state code.
-
-        Args:
-            data (Int32):    One state code describing what the arm is doing
-
-        Returns:
-        '''
-
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the code, and log it while you are developing. Zero is healthy; anything
-        #       else is the arm telling you about the last command or its own state.
-        #       ->  HINT: /arm_status_detail says the same thing in words.
-        #       ->  NOTE: A protective stop LATCHES and cannot be cleared - the run is over.
-
-        ############################################
-
-
-    def switch_controller(self, controller):
-        '''
-        Description:    Function to make one of the arm's two command interfaces the active
-                        one, so that commands published to it are acted on.
-
-        Args:
-            controller  (str):      Name of the controller to activate, either
-                                    'twist_controller' or 'joint_controller'
-
-        Returns:
-            success     (bool):     Whether the controller was activated
-        '''
-
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Call the switch_controller service on self.switch_cli-
-        #           req = SwitchController.Request()
-        #           req.activate_controllers = [ the one you want ]
-        #           req.deactivate_controllers = [ the other one ]
-        #           req.strictness = SwitchController.Request.STRICT
-
-        #   ->  Wait for it first, and expect the first attempt to fail-
-        #           self.switch_cli.wait_for_service(timeout_sec=20.0)
-        #           future = self.switch_cli.call_async(req)
-        #           rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-        #       ->  NOTE: That last call HANGS if made from a callback of a node that is
-        #                 already spinning. __init__ is safe; from the timer, poll
-        #                 'future.done()' instead.
-
-        #   ->  Do not switch more often than you need to.
-
-        ############################################
-
-
-    def process_waypoints(self):
-        '''
-        Description:    Timer function used to drive the tool through the waypoints.
-
-        Args:
-        Returns:
-        '''
-
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Return early until pose, joints and status have all arrived.
-
-        #   ->  Both topics carry VELOCITIES, never positions.
-
-        #   ->  Build the message for whichever interface you made active:
-        #           TwistStamped on self.twist_pub  - linear and angular velocity, in 'base_frame'
-        #           JointJog on self.joint_pub      - 'joint_names' and a velocity for each
-        #       ->  HINT: msg.header.stamp = self.get_clock().now().to_msg()      (both)
-        #                 msg.header.frame_id = base_frame                        (twist)
-        #                 msg.twist.linear.x/.y/.z, msg.twist.angular.x/.y/.z     (twist)
-        #                 msg.joint_names = joint_names, msg.velocities = [...]   (jog)
-
-        #   ->  Publish on EVERY tick, zero included - see 'command_timeout_s'. Never sleep
-        #       inside this function.
-
-        #   ->  Drive the tool at a velocity proportional to the error-
-        #           v = Kp * (target - current)
-        #       ->  HINT: Cap it by scaling the WHOLE vector: v = v * (cap / |v|)
-        #       ->  NOTE: The servo ramps down rather than stopping dead, so the arm settles
-        #                 PAST the pose that satisfied you.
-
-        #   ->  Command the tool's ORIENTATION too, or the servo decides the wrist for you.
-        #       ->  HINT: The turn from unit vector 'a' onto unit vector 'b', as an axis
-        #                 times an angle-
-        #                     c     = cross(a, b)
-        #                     e     = c / |c| * atan2(|c|, dot(a, b))
-        #                     omega = Kp * e
-        #                 'a' is the tool's own axis - a column of
-        #                 Rotation.from_quat([x, y, z, w]).as_matrix().
-
-        #   ->  Think about the PATH. The arm has joint limits and configurations it cannot
-        #       pass through.
-
-        #   ->  Track which waypoint you are on, and log the distance to it while developing.
-
-        ############################################
-
-
-##################### FUNCTION DEFINITION #######################
+# ====================================================================
+# MAIN
+# ====================================================================
 
 def main():
-    '''
-    Description:    Main function which creates a ROS node and spins around for the
-                    arm_waypoints class to perform its task
-    '''
 
-    rclpy.init(args=sys.argv)                                       # initialisation
+    rclpy.init(args=sys.argv)
 
-    node = rclpy.create_node('arm_waypoints_process')               # creating ROS node
+    node = ebot_nav()
 
-    node.get_logger().info('Node created: Arm waypoints process')   # logging information
+    try:
 
-    arm_waypoints_class = arm_waypoints()                           # creating a new object for class 'arm_waypoints'
+        rclpy.spin(node)
 
-    rclpy.spin(arm_waypoints_class)                                 # spining on the object to make it alive in ROS 2 DDS
+    except KeyboardInterrupt:
 
-    arm_waypoints_class.destroy_node()                              # destroy node after spin ends
+        pass
 
-    rclpy.shutdown()                                                # shutdown process
+    finally:
+
+        node.stop_robot()
+
+        node.destroy_node()
+
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
