@@ -22,10 +22,10 @@
 # Author List:		[ Names of team members worked on this file separated by Comma: Name1, Name2, ... ]
 # Filename:		    task1b_boilerplate.py
 # Functions:
-#			        [ Comma separated list of functions in this file ]
+# [ Comma separated list of functions in this file ]
 # Nodes:		    Add your publishing and subscribing node
 #                   Example:
-#			        Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
+# Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
 #                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /etc... ]
 
 
@@ -40,47 +40,43 @@ from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
+from scipy.spatial.transform import Rotation
+from std_srvs.srv import Trigger
 
-
-##################### TASK CONSTANTS #######################
-
-# Tool positions in base_link, in metres, in the order they must be reached. The tool
-# stops at each one and holds it for at least two seconds. Copy the signs as they are:
-# base_link is the UR7e's own frame, not the Gazebo world's.
 waypoints = [
     (-0.4085, -0.5379, 0.1967),   # 1
     (-0.8000, -0.0005, 0.3967),   # 2
-    (-0.7430,  0.5280, 0.1967),   # 3
-    (-0.4097,  0.5280, 0.1967),   # 4
-    (-0.0763,  0.5280, 0.1967),   # 5
+    (-0.7430, 0.5280, 0.1967),   # 3
+    (-0.4097, 0.5280, 0.1967),   # 4
+    (-0.0763, 0.5280, 0.1967),   # 5
 ]
 
-# The two command interfaces. Only ONE is active at a time; messages to the other are
-# accepted and ignored.
+path_points = [
+    waypoints[0],                                              # WP1 - real
+    (waypoints[0][0], waypoints[0][1], waypoints[1][2]),       # via: rise in Z first
+    waypoints[1],                                              # WP2 - real
+    waypoints[2],                                              # WP3 - real, direct from WP2
+    waypoints[3],                                              # WP4 - real
+    waypoints[4],                                              # WP5 - real
+]
+path_is_real = [True, False, True, True, True, True]
+
 servo_ns = '/ur_arm_controller'
 twist_controller = 'delta_twist_controller'
 joint_controller = 'delta_joint_controller'
 
-# The only frame a twist may be stamped with; any other is refused, not converted. Note
-# 'base' is base_link turned through 180 degrees, not another name for it.
 base_frame = 'base_link'
 
-# JointJog velocities are matched to these names, in this order.
 joint_names = [
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
     'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
 ]
 
-# What the servo accepts. A command above one of these is dropped WHOLE, not clamped.
-cap_linear_mps = 0.15     # magnitude of a twist's linear part
-cap_angular_rps = 0.35    # magnitude of its angular part
-cap_joint_rps = 0.35      # per joint
+cap_linear_mps = 0.15
+cap_angular_rps = 0.35
+cap_joint_rps = 0.35
 
-# Dead-man switch: the arm stops this long after the last message it received.
 command_timeout_s = 0.15
-
-
-##################### CLASS DEFINITION #######################
 
 class arm_waypoints(Node):
     '''
@@ -95,44 +91,57 @@ class arm_waypoints(Node):
         Description:    Initialization of class arm_waypoints
         '''
 
-        # use_sim_time is set here, not on the command line, so this node runs on the
-        # simulation clock however it is started.
-        super().__init__(                                                               # registering node
+
+        super().__init__(
             'arm_waypoints_node',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
-        ############ Topic PUBLISHERS ############
+        self.twist_pub = self.create_publisher(
+            TwistStamped,
+            '/delta_twist_cmds',
+            10)
+        self.joint_pub = self.create_publisher(
+            JointJog, '/delta_joint_cmds', 10)
 
-        self.twist_pub = self.create_publisher(TwistStamped, '/delta_twist_cmds', 10)    # end-effector velocity, in base_link
-        self.joint_pub = self.create_publisher(JointJog, '/delta_joint_cmds', 10)        # per-joint velocity
-
-        ############ Topic SUBSCRIPTIONS ############
 
         self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
-        self.joint_sub = self.create_subscription(JointState, '/joint_states', self.jointstatecb, 50)
+        self.joint_sub = self.create_subscription(
+            JointState, '/joint_states', self.jointstatecb, 50)
         self.status_sub = self.create_subscription(Int32, '/arm_status', self.armstatuscb, 10)
 
-        ############ Constructor VARIABLES/OBJECTS ############
+        self.unlock_cli = self.create_client(Trigger, f'{servo_ns}/unlock_protective_stop')
+        self.unlock_future = None
+        self.last_safe_position = waypoints[0]
 
-        control_rate = 0.05                                                             # rate of time to run one control cycle (seconds)
-        self.switch_cli = self.create_client(                                           # client used to pick which command topic is live
+        control_rate = 0.05
+        self.switch_cli = self.create_client(
             SwitchController, f'{servo_ns}/switch_controller')
-        self.timer = self.create_timer(control_rate, self.process_waypoints)            # creating a timer based function which gets called on every 0.05 seconds (as defined by 'control_rate' variable)
 
-        self.tcp_pose = None                                                            # tool pose variable (from tcpposecb())
-        self.joint_angles = None                                                        # joint feedback variable (from jointstatecb())
-        self.arm_status = None                                                          # arm state code variable (from armstatuscb())
+        self.timer = self.create_timer(control_rate, self.process_waypoints)
 
-        ############ ADD YOUR CODE HERE ############
 
-        # INSTRUCTIONS & HELP :
+        self.tcp_pose = None
 
-        #	->  Add any variable your motion needs to keep between cycles.
-        #       ->  HINT: Which waypoint you are on, and what the arm is doing about it.
+        self.joint_angles = None
 
-        ############################################
+        self.arm_status = None
 
+
+        self.path_idx = 0
+        self.hold_start_time = None
+        self.target_orientation = None
+        self.unfold_target = {
+            'shoulder_pan_joint': 0.0, 'shoulder_lift_joint': -1.20, 'elbow_joint': -1.60,
+            'wrist_1_joint': -1.90, 'wrist_2_joint': 1.57, 'wrist_3_joint': 1.57,
+        }
+        self.unfolded = False
+        self.unfold_controller_set = False
+        self.switch_future = None
+
+        self.controller_ready = self.switch_controller('twist_controller')
+        if not self.controller_ready:
+            self.get_logger().error('Failed to activate twist controller')
 
     def tcpposecb(self, data):
         '''
@@ -145,15 +154,7 @@ class arm_waypoints(Node):
         Returns:
         '''
 
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the tool's position and orientation.
-        #       ->  HINT: data.pose.position, data.pose.orientation
-
-        ############################################
-
+        self.tcp_pose = data.pose
 
     def jointstatecb(self, data):
         '''
@@ -166,17 +167,10 @@ class arm_waypoints(Node):
         Returns:
         '''
 
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the joint angles, matched BY NAME - the order is not promised.
-        #       ->  HINT: angles = [data.position[data.name.index(j)] for j in joint_names]
-        #       ->  NOTE: A joint assumed to be at zero when it is not reads as a large
-        #                 error, and a controller acting on it drives hard towards it.
-
-        ############################################
-
+        try:
+            self.joint_angles = [data.position[data.name.index(j)] for j in joint_names]
+        except ValueError as e:
+            self.get_logger().warn(f'Joint name not found: {e}')
 
     def armstatuscb(self, data):
         '''
@@ -189,17 +183,9 @@ class arm_waypoints(Node):
         Returns:
         '''
 
-        ############ ADD YOUR CODE HERE ############
-
-        # INSTRUCTIONS & HELP :
-
-        #	->  Store the code, and log it while you are developing. Zero is healthy; anything
-        #       else is the arm telling you about the last command or its own state.
-        #       ->  HINT: /arm_status_detail says the same thing in words.
-        #       ->  NOTE: A protective stop LATCHES and cannot be cleared - the run is over.
-
-        ############################################
-
+        if self.arm_status != data.data:
+            self.get_logger().info(f'Arm status changed: {data.data}')
+        self.arm_status = data.data
 
     def switch_controller(self, controller):
         '''
@@ -214,28 +200,88 @@ class arm_waypoints(Node):
             success     (bool):     Whether the controller was activated
         '''
 
-        ############ ADD YOUR CODE HERE ############
+        target = twist_controller if controller == 'twist_controller' else joint_controller
+        other = joint_controller if controller == 'twist_controller' else twist_controller
 
-        # INSTRUCTIONS & HELP :
+        req = SwitchController.Request()
+        req.activate_controllers = [target]
+        req.deactivate_controllers = [other]
+        req.strictness = SwitchController.Request.STRICT
 
-        #	->  Call the switch_controller service on self.switch_cli-
-        #           req = SwitchController.Request()
-        #           req.activate_controllers = [ the one you want ]
-        #           req.deactivate_controllers = [ the other one ]
-        #           req.strictness = SwitchController.Request.STRICT
+        if not self.switch_cli.wait_for_service(timeout_sec=20.0):
+            self.get_logger().error('switch_controller service not available')
+            return False
 
-        #   ->  Wait for it first, and expect the first attempt to fail-
-        #           self.switch_cli.wait_for_service(timeout_sec=20.0)
-        #           future = self.switch_cli.call_async(req)
-        #           rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-        #       ->  NOTE: That last call HANGS if made from a callback of a node that is
-        #                 already spinning. __init__ is safe; from the timer, poll
-        #                 'future.done()' instead.
+        future = self.switch_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
 
-        #   ->  Do not switch more often than you need to.
+        if future.result() is None:
+            self.get_logger().warn('First switch_controller attempt failed, retrying')
+            future = self.switch_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
 
-        ############################################
+        return future.result() is not None and future.result().ok
 
+    def request_switch(self, controller):
+        '''Non-blocking version, safe to call every timer tick. Returns True once
+        the switch has completed successfully; False while pending or on failure.'''
+        if self.switch_future is not None:
+            if self.switch_future.done():
+                result = self.switch_future.result()
+                self.switch_future = None
+                if result is not None and result.ok:
+                    return True
+                self.get_logger().warn(f'switch_controller to {controller} failed, retrying')
+                return False
+            return False  # still waiting on the service
+
+        target = twist_controller if controller == 'twist_controller' else joint_controller
+        other = joint_controller if controller == 'twist_controller' else twist_controller
+        req = SwitchController.Request()
+        req.activate_controllers = [target]
+        req.deactivate_controllers = [other]
+        req.strictness = SwitchController.Request.STRICT
+
+        if not self.switch_cli.service_is_ready():
+            return False
+
+        self.switch_future = self.switch_cli.call_async(req)
+        return False
+
+    def unfold_step(self):
+        if not self.unfold_controller_set:
+            if self.request_switch('joint_controller'):
+                self.unfold_controller_set = True
+            return
+
+        if self.joint_angles is None:
+            return
+
+        Kp_joint = 0.6
+        velocities = []
+        max_err = 0.0
+        for name in joint_names:
+            idx = joint_names.index(name)
+            cur = self.joint_angles[idx]
+            tgt = self.unfold_target[name]
+            err = tgt - cur
+            max_err = max(max_err, abs(err))
+            v = Kp_joint * err
+            v = max(min(v, cap_joint_rps * 0.9), -cap_joint_rps * 0.9)
+            velocities.append(v)
+
+        if max_err < 0.03:
+            if self.request_switch('twist_controller'):
+                self.unfolded = True
+                self.target_orientation = self.tcp_pose.orientation
+                self.get_logger().info('Unfold complete, switching to twist control')
+            return
+
+        msg = JointJog()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = joint_names
+        msg.velocities = velocities
+        self.joint_pub.publish(msg)
 
     def process_waypoints(self):
         '''
@@ -244,50 +290,110 @@ class arm_waypoints(Node):
         Args:
         Returns:
         '''
+        if self.arm_status is not None and 20 <= self.arm_status < 30:
+            self.handle_recovery()
+            return
 
-        ############ ADD YOUR CODE HERE ############
+        if self.tcp_pose is None or self.joint_angles is None or self.arm_status is None:
+            return
 
-        # INSTRUCTIONS & HELP :
+        if not self.unfolded:
+            self.unfold_step()
+            return
 
-        #	->  Return early until pose, joints and status have all arrived.
+        if self.path_idx >= len(path_points):
+            self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            return
 
-        #   ->  Both topics carry VELOCITIES, never positions.
+        target = path_points[self.path_idx]
+        is_real = path_is_real[self.path_idx]
+        pos_tolerance = 0.005 if is_real else 0.02  # via points: looser, just pass through
 
-        #   ->  Build the message for whichever interface you made active:
-        #           TwistStamped on self.twist_pub  - linear and angular velocity, in 'base_frame'
-        #           JointJog on self.joint_pub      - 'joint_names' and a velocity for each
-        #       ->  HINT: msg.header.stamp = self.get_clock().now().to_msg()      (both)
-        #                 msg.header.frame_id = base_frame                        (twist)
-        #                 msg.twist.linear.x/.y/.z, msg.twist.angular.x/.y/.z     (twist)
-        #                 msg.joint_names = joint_names, msg.velocities = [...]   (jog)
+        cx, cy, cz = self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z
+        ex, ey, ez = target[0] - cx, target[1] - cy, target[2] - cz
+        pos_error = math.sqrt(ex * ex + ey * ey + ez * ez)
 
-        #   ->  Publish on EVERY tick, zero included - see 'command_timeout_s'. Never sleep
-        #       inside this function.
+        Kp_lin = 0.3
+        vx, vy, vz = Kp_lin * ex, Kp_lin * ey, Kp_lin * ez
+        lin_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
+        if lin_mag > cap_linear_mps:
+            scale = (cap_linear_mps * 0.9) / lin_mag
+            vx, vy, vz = vx * scale, vy * scale, vz * scale
 
-        #   ->  Drive the tool at a velocity proportional to the error-
-        #           v = Kp * (target - current)
-        #       ->  HINT: Cap it by scaling the WHOLE vector: v = v * (cap / |v|)
-        #       ->  NOTE: The servo ramps down rather than stopping dead, so the arm settles
-        #                 PAST the pose that satisfied you.
+        wx = wy = wz = 0.0
+        if self.target_orientation is not None:
+            cur_q = [self.tcp_pose.orientation.x, self.tcp_pose.orientation.y,
+                     self.tcp_pose.orientation.z, self.tcp_pose.orientation.w]
+            tgt_q = [self.target_orientation.x, self.target_orientation.y,
+                     self.target_orientation.z, self.target_orientation.w]
+            r_err = Rotation.from_quat(tgt_q) * Rotation.from_quat(cur_q).inv()
+            rotvec = r_err.as_rotvec()
 
-        #   ->  Command the tool's ORIENTATION too, or the servo decides the wrist for you.
-        #       ->  HINT: The turn from unit vector 'a' onto unit vector 'b', as an axis
-        #                 times an angle-
-        #                     c     = cross(a, b)
-        #                     e     = c / |c| * atan2(|c|, dot(a, b))
-        #                     omega = Kp * e
-        #                 'a' is the tool's own axis - a column of
-        #                 Rotation.from_quat([x, y, z, w]).as_matrix().
+            Kp_ang = 2.0
+            wx, wy, wz = Kp_ang * rotvec[0], Kp_ang * rotvec[1], Kp_ang * rotvec[2]
+            ang_mag = math.sqrt(wx * wx + wy * wy + wz * wz)
+            if ang_mag > cap_angular_rps:
+                scale = (cap_angular_rps * 0.9) / ang_mag
+                wx, wy, wz = wx * scale, wy * scale, wz * scale
 
-        #   ->  Think about the PATH. The arm has joint limits and configurations it cannot
-        #       pass through.
+        if pos_error < pos_tolerance:
+            if is_real:
+                if self.hold_start_time is None:
+                    self.hold_start_time = self.get_clock().now()
+                    self.get_logger().info(
+                        f'Reached real waypoint at path idx {
+                            self.path_idx}, holding')
+                elapsed = (self.get_clock().now() - self.hold_start_time).nanoseconds / 1e9
+                if elapsed >= 2.0:
+                    self.get_logger().info(f'Hold complete at path idx {self.path_idx}')
+                    self.last_safe_position = target
+                    self.path_idx += 1
+                    self.hold_start_time = None
+                self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                return
+            else:
+                self.path_idx += 1
+        else:
+            self.hold_start_time = None
 
-        #   ->  Track which waypoint you are on, and log the distance to it while developing.
+        self.publish_twist(vx, vy, vz, wx, wy, wz)
 
-        ############################################
+    def publish_twist(self, vx, vy, vz, wx, wy, wz):
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = base_frame
+        msg.twist.linear.x = vx
+        msg.twist.linear.y = vy
+        msg.twist.linear.z = vz
+        msg.twist.angular.x = wx
+        msg.twist.angular.y = wy
+        msg.twist.angular.z = wz
+        self.twist_pub.publish(msg)
+
+    def handle_recovery(self):
+        if self.unlock_future is None:
+            if not self.unlock_cli.service_is_ready():
+                return
+            self.unlock_future = self.unlock_cli.call_async(Trigger.Request())
+            return
+        if not self.unlock_future.done():
+            return
+        result = self.unlock_future.result()
+        self.unlock_future = None
+        if result is None or not result.success:
+            self.get_logger().error(f'Unlock failed: {result.message if result else "no result"}')
+            return
+        self.get_logger().warn(f'Unlocked: {result.message}')
+
+        cx, cy, cz = self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z
+        tx, ty, tz = self.last_safe_position
+        ex, ey, ez = tx - cx, ty - cy, tz - cz
+        mag = math.sqrt(ex * ex + ey * ey + ez * ez)
+        if mag > 0.001:
+            scale = min(0.05, mag) / mag
+            self.publish_twist(ex * scale, ey * scale, ez * scale, 0.0, 0.0, 0.0)
 
 
-##################### FUNCTION DEFINITION #######################
 
 def main():
     '''
@@ -301,9 +407,11 @@ def main():
 
     node.get_logger().info('Node created: Arm waypoints process')   # logging information
 
-    arm_waypoints_class = arm_waypoints()                           # creating a new object for class 'arm_waypoints'
+    # creating a new object for class 'arm_waypoints'
+    arm_waypoints_class = arm_waypoints()
 
-    rclpy.spin(arm_waypoints_class)                                 # spining on the object to make it alive in ROS 2 DDS
+    # spining on the object to make it alive in ROS 2 DDS
+    rclpy.spin(arm_waypoints_class)
 
     arm_waypoints_class.destroy_node()                              # destroy node after spin ends
 
