@@ -78,6 +78,7 @@ cap_joint_rps = 0.35
 
 command_timeout_s = 0.15
 
+
 class arm_waypoints(Node):
     '''
     ___CLASS___
@@ -91,7 +92,6 @@ class arm_waypoints(Node):
         Description:    Initialization of class arm_waypoints
         '''
 
-
         super().__init__(
             'arm_waypoints_node',
             parameter_overrides=[rclpy.parameter.Parameter(
@@ -103,7 +103,6 @@ class arm_waypoints(Node):
             10)
         self.joint_pub = self.create_publisher(
             JointJog, '/delta_joint_cmds', 10)
-
 
         self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
         self.joint_sub = self.create_subscription(
@@ -120,13 +119,13 @@ class arm_waypoints(Node):
 
         self.timer = self.create_timer(control_rate, self.process_waypoints)
 
-
         self.tcp_pose = None
 
         self.joint_angles = None
 
         self.arm_status = None
 
+        self.recovery_controller_set = False
 
         self.path_idx = 0
         self.hold_start_time = None
@@ -313,7 +312,7 @@ class arm_waypoints(Node):
         ex, ey, ez = target[0] - cx, target[1] - cy, target[2] - cz
         pos_error = math.sqrt(ex * ex + ey * ey + ez * ez)
 
-        Kp_lin = 0.3
+        Kp_lin = 0.2
         vx, vy, vz = Kp_lin * ex, Kp_lin * ey, Kp_lin * ez
         lin_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
         if lin_mag > cap_linear_mps:
@@ -385,14 +384,38 @@ class arm_waypoints(Node):
             return
         self.get_logger().warn(f'Unlocked: {result.message}')
 
-        cx, cy, cz = self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z
-        tx, ty, tz = self.last_safe_position
-        ex, ey, ez = tx - cx, ty - cy, tz - cz
-        mag = math.sqrt(ex * ex + ey * ey + ez * ez)
-        if mag > 0.001:
-            scale = min(0.05, mag) / mag
-            self.publish_twist(ex * scale, ey * scale, ez * scale, 0.0, 0.0, 0.0)
+        if not self.recovery_controller_set:
+            if self.request_switch('joint_controller'):
+                self.recovery_controller_set = True
+            return
 
+        if self.joint_angles is None:
+            return
+
+        Kp_joint = 0.4
+        velocities = []
+        max_err = 0.0
+        for name in joint_names:
+            idx = joint_names.index(name)
+            cur = self.joint_angles[idx]
+            tgt = self.unfold_target[name]
+            err = tgt - cur
+            max_err = max(max_err, abs(err))
+            v = Kp_joint * err
+            v = max(min(v, cap_joint_rps * 0.8), -cap_joint_rps * 0.8)
+            velocities.append(v)
+
+        if max_err < 0.1:
+            if self.request_switch('twist_controller'):
+                self.recovery_controller_set = False
+                self.get_logger().info('Recovered clear of singularity, resuming twist control')
+            return
+
+        msg = JointJog()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = joint_names
+        msg.velocities = velocities
+        self.joint_pub.publish(msg)
 
 
 def main():
