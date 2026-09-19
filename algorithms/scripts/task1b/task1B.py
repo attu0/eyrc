@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
 
-
 '''
-*****************************************************************************************
-*
-*        		===============================================
-*           		        StrataCobot (SC) Theme (eYRC 2026-27)
-*        		===============================================
-*
-*  This script should be used to implement Task 1B of StrataCobot (SC) Theme (eYRC 2026-27).
-*
-*  This software is made available on an "AS IS WHERE IS BASIS".
-*  Licensee/end user indemnifies and will keep e-Yantra indemnified from
-*  any and all claim(s) that emanate from the use of the Software or
-*  breach of the terms of this agreement.
-*
-*****************************************************************************************
-'''
-
 # Team ID:          [ Team-ID ]
 # Author List:		[ Names of team members worked on this file separated by Comma: Name1, Name2, ... ]
 # Filename:		    task1b_boilerplate.py
@@ -27,7 +10,7 @@
 #                   Example:
 # Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
 #                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /etc... ]
-
+'''
 
 ################### IMPORT MODULES #######################
 
