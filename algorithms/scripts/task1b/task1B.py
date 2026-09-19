@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 
+
 '''
+*****************************************************************************************
+*
+*        		===============================================
+*           		        StrataCobot (SC) Theme (eYRC 2026-27)
+*        		===============================================
+*
+*  This script should be used to implement Task 1B of StrataCobot (SC) Theme (eYRC 2026-27).
+*
+*  This software is made available on an "AS IS WHERE IS BASIS".
+*  Licensee/end user indemnifies and will keep e-Yantra indemnified from
+*  any and all claim(s) that emanate from the use of the Software or
+*  breach of the terms of this agreement.
+*
+*****************************************************************************************
+'''
+
 # Team ID:          [ Team-ID ]
 # Author List:		[ Names of team members worked on this file separated by Comma: Name1, Name2, ... ]
 # Filename:		    task1b_boilerplate.py
@@ -10,7 +27,7 @@
 #                   Example:
 # Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
 #                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /etc... ]
-'''
+
 
 ################### IMPORT MODULES #######################
 
@@ -23,9 +40,14 @@ from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
-from scipy.spatial.transform import Rotation
 from std_srvs.srv import Trigger
 
+
+##################### TASK CONSTANTS #######################
+
+# Tool positions in base_link, in metres, in the order they must be reached. The tool
+# stops at each one and holds it for at least two seconds. Copy the signs as they are:
+# base_link is the UR7e's own frame, not the Gazebo world's.
 waypoints = [
     (-0.4085, -0.5379, 0.1967),   # 1
     (-0.8000, -0.0005, 0.3967),   # 2
@@ -35,31 +57,70 @@ waypoints = [
 ]
 
 path_points = [
-    waypoints[0],                                              # WP1 - real
-    (waypoints[0][0], waypoints[0][1], waypoints[1][2]),       # via: rise in Z first
-    waypoints[1],                                              # WP2 - real
-    waypoints[2],                                              # WP3 - real, direct from WP2
-    waypoints[3],                                              # WP4 - real
-    waypoints[4],                                              # WP5 - real
+    waypoints[0],
+    (waypoints[0][0], waypoints[0][1], waypoints[1][2]),
+    waypoints[1],
+    waypoints[2],
+    waypoints[3],
+    waypoints[4],
 ]
-path_is_real = [True, False, True, True, True, True]
 
+path_is_real = [
+    True,
+    False,
+    True,
+    True,
+    True,
+    True,
+]
+
+# The two command interfaces. Only ONE is active at a time; messages to the other are
+# accepted and ignored.
 servo_ns = '/ur_arm_controller'
 twist_controller = 'delta_twist_controller'
 joint_controller = 'delta_joint_controller'
 
+# The only frame a twist may be stamped with; any other is refused, not converted. Note
+# 'base' is base_link turned through 180 degrees, not another name for it.
 base_frame = 'base_link'
 
+# JointJog velocities are matched to these names, in this order.
 joint_names = [
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
     'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
 ]
 
-cap_linear_mps = 0.15
-cap_angular_rps = 0.35
-cap_joint_rps = 0.35
+# What the servo accepts. A command above one of these is dropped WHOLE, not clamped.
+cap_linear_mps = 0.15     # magnitude of a twist's linear part
+cap_angular_rps = 0.35    # magnitude of its angular part
+cap_joint_rps = 0.35      # per joint
 
+unfold_target = {
+    'shoulder_pan_joint': 0.0,
+    'shoulder_lift_joint': -1.20,
+    'elbow_joint': -1.60,
+    'wrist_1_joint': -1.90,
+    'wrist_2_joint': 1.57,
+    'wrist_3_joint': 1.57,
+}
+
+recovery_target = {
+    'shoulder_pan_joint': 0.0,
+    'shoulder_lift_joint': -0.523599,
+    'elbow_joint': -2.443461,
+    'wrist_1_joint': -0.174533,
+    'wrist_2_joint': 1.57,
+    'wrist_3_joint': 1.57,
+}
+
+unfold_kp = 0.6
+
+# Dead-man switch: the arm stops this long after the last message it received.
 command_timeout_s = 0.15
+
+position_tolerance = 0.005   # 5 mm
+
+##################### CLASS DEFINITION #######################
 
 
 class arm_waypoints(Node):
@@ -75,55 +136,77 @@ class arm_waypoints(Node):
         Description:    Initialization of class arm_waypoints
         '''
 
-        super().__init__(
+        # use_sim_time is set here, not on the command line, so this node runs on the
+        # simulation clock however it is started.
+        super().__init__(                                                               # registering node
             'arm_waypoints_node',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)])
 
+        ############ Topic PUBLISHERS ############
+
         self.twist_pub = self.create_publisher(
             TwistStamped,
             '/delta_twist_cmds',
-            10)
+            10)    # end-effector velocity, in base_link
         self.joint_pub = self.create_publisher(
-            JointJog, '/delta_joint_cmds', 10)
+            JointJog, '/delta_joint_cmds', 10)        # per-joint velocity
+
+        ############ Topic SUBSCRIPTIONS ############
 
         self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
         self.joint_sub = self.create_subscription(
             JointState, '/joint_states', self.jointstatecb, 50)
         self.status_sub = self.create_subscription(Int32, '/arm_status', self.armstatuscb, 10)
 
-        self.unlock_cli = self.create_client(Trigger, f'{servo_ns}/unlock_protective_stop')
-        self.unlock_future = None
-        self.last_safe_position = waypoints[0]
+        ############ Constructor VARIABLES/OBJECTS ############
 
+        # rate of time to run one control cycle (seconds)
         control_rate = 0.05
-        self.switch_cli = self.create_client(
+        self.switch_cli = self.create_client(                                           # client used to pick which command topic is live
             SwitchController, f'{servo_ns}/switch_controller')
-
+        # creating a timer based function which gets called on every 0.05 seconds
+        # (as defined by 'control_rate' variable)
         self.timer = self.create_timer(control_rate, self.process_waypoints)
 
+        # tool pose variable (from tcpposecb())
         self.tcp_pose = None
-
+        # joint feedback variable (from jointstatecb())
         self.joint_angles = None
-
+        # arm state code variable (from armstatuscb())
         self.arm_status = None
+        self.recovery_required = False
+        self.in_recovery = False
 
-        self.recovery_controller_set = False
-
+        # index of the current waypoint to reach
         self.path_idx = 0
+        # time spent holding at the current waypoint
+        self.holding = False
+        # whether the arm is currently holding at a waypoint
         self.hold_start_time = None
-        self.target_orientation = None
-        self.unfold_target = {
-            'shoulder_pan_joint': 0.0, 'shoulder_lift_joint': -1.20, 'elbow_joint': -1.60,
-            'wrist_1_joint': -1.90, 'wrist_2_joint': 1.57, 'wrist_3_joint': 1.57,
-        }
         self.unfolded = False
-        self.unfold_controller_set = False
-        self.switch_future = None
 
-        self.controller_ready = self.switch_controller('twist_controller')
-        if not self.controller_ready:
-            self.get_logger().error('Failed to activate twist controller')
+        self.switch_future = None
+        self.switch_target = None
+
+        self.motion_state = 'INIT'
+        self.recovery_state = 'NONE'
+
+        self.unlock_client = self.create_client(
+            Trigger,
+            '/ur_arm_controller/unlock_protective_stop'
+        )
+
+        self.unlock_future = None
+
+        ############ ADD YOUR CODE HERE ############
+
+        # INSTRUCTIONS & HELP :
+
+        # ->  Add any variable your motion needs to keep between cycles.
+        #       ->  HINT: Which waypoint you are on, and what the arm is doing about it.
+
+        ############################################
 
     def tcpposecb(self, data):
         '''
@@ -149,25 +232,28 @@ class arm_waypoints(Node):
         Returns:
         '''
 
-        try:
-            self.joint_angles = [data.position[data.name.index(j)] for j in joint_names]
-        except ValueError as e:
-            self.get_logger().warn(f'Joint name not found: {e}')
+        self.joint_angles = [
+            data.position[data.name.index(joint)]
+            for joint in joint_names
+        ]
 
     def armstatuscb(self, data):
         '''
-        Description:    Callback function for the arm status topic.
-                        Use this function to receive the arm's current state code.
+        Description:
+            Callback function for the arm status topic.
 
         Args:
-            data (Int32):    One state code describing what the arm is doing
+            data (Int32): One state code describing the arm state.
 
         Returns:
+            None
         '''
 
-        if self.arm_status != data.data:
-            self.get_logger().info(f'Arm status changed: {data.data}')
         self.arm_status = data.data
+
+        if 20 <= self.arm_status <= 29:
+            if not self.in_recovery:
+                self.recovery_required = True
 
     def switch_controller(self, controller):
         '''
@@ -182,246 +268,402 @@ class arm_waypoints(Node):
             success     (bool):     Whether the controller was activated
         '''
 
-        target = twist_controller if controller == 'twist_controller' else joint_controller
-        other = joint_controller if controller == 'twist_controller' else twist_controller
-
         req = SwitchController.Request()
-        req.activate_controllers = [target]
-        req.deactivate_controllers = [other]
+        req.activate_controllers = [controller]
+
+        if controller == twist_controller:
+            other_controller = joint_controller
+        else:
+            other_controller = twist_controller
+
+        req.deactivate_controllers = [other_controller]
         req.strictness = SwitchController.Request.STRICT
 
         if not self.switch_cli.wait_for_service(timeout_sec=20.0):
-            self.get_logger().error('switch_controller service not available')
-            return False
-
-        future = self.switch_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-
-        if future.result() is None:
-            self.get_logger().warn('First switch_controller attempt failed, retrying')
-            future = self.switch_cli.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-
-        return future.result() is not None and future.result().ok
-
-    def request_switch(self, controller):
-        '''Non-blocking version, safe to call every timer tick. Returns True once
-        the switch has completed successfully; False while pending or on failure.'''
-        if self.switch_future is not None:
-            if self.switch_future.done():
-                result = self.switch_future.result()
-                self.switch_future = None
-                if result is not None and result.ok:
-                    return True
-                self.get_logger().warn(f'switch_controller to {controller} failed, retrying')
-                return False
-            return False  # still waiting on the service
-
-        target = twist_controller if controller == 'twist_controller' else joint_controller
-        other = joint_controller if controller == 'twist_controller' else twist_controller
-        req = SwitchController.Request()
-        req.activate_controllers = [target]
-        req.deactivate_controllers = [other]
-        req.strictness = SwitchController.Request.STRICT
-
-        if not self.switch_cli.service_is_ready():
+            self.get_logger().error('Controller switch service not available')
             return False
 
         self.switch_future = self.switch_cli.call_async(req)
+        self.switch_target = controller
+
+        return None
+
+    def unfold_arm(self):
+        '''
+        Description:
+            Move all arm joints toward a safe unfolded configuration
+            before beginning Cartesian waypoint motion.
+
+        Returns:
+            bool: True when the arm has been sufficiently unfolded.
+        '''
+
+        velocities = []
+        max_error = 0.0
+
+        for joint in joint_names:
+
+            joint_index = joint_names.index(joint)
+
+            current_angle = self.joint_angles[joint_index]
+            target_angle = unfold_target[joint]
+
+            error = target_angle - current_angle
+
+            max_error = max(max_error, abs(error))
+
+            velocity = unfold_kp * error
+
+            velocity = max(
+                min(velocity, cap_joint_rps * 0.9),
+                -cap_joint_rps * 0.9
+            )
+
+            velocities.append(velocity)
+
+        if max_error < 0.03:
+
+            msg = JointJog()
+
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.joint_names = joint_names
+            msg.velocities = [0.0] * len(joint_names)
+
+            self.joint_pub.publish(msg)
+
+            self.unfolded = True
+
+            self.get_logger().info(
+                'Arm unfolded. Switching to twist controller.'
+            )
+
+            return True
+
+        msg = JointJog()
+
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.joint_names = joint_names
+        msg.velocities = velocities
+
+        self.joint_pub.publish(msg)
+
         return False
 
-    def unfold_step(self):
-        if not self.unfold_controller_set:
-            if self.request_switch('joint_controller'):
-                self.unfold_controller_set = True
-            return
+    def recover_arm(self):
+        '''
+        Description:
+            Move the shoulder lift joint upward to raise the arm
+            away from the platform.
 
-        if self.joint_angles is None:
-            return
+        Returns:
+            bool: True when the shoulder has moved sufficiently.
+        '''
 
-        Kp_joint = 0.6
-        velocities = []
-        max_err = 0.0
-        for name in joint_names:
-            idx = joint_names.index(name)
-            cur = self.joint_angles[idx]
-            tgt = self.unfold_target[name]
-            err = tgt - cur
-            max_err = max(max_err, abs(err))
-            v = Kp_joint * err
-            v = max(min(v, cap_joint_rps * 0.9), -cap_joint_rps * 0.9)
-            velocities.append(v)
+        joint_index = joint_names.index('shoulder_lift_joint')
 
-        if max_err < 0.03:
-            if self.request_switch('twist_controller'):
-                self.unfolded = True
-                self.target_orientation = self.tcp_pose.orientation
-                self.get_logger().info('Unfold complete, switching to twist control')
-            return
+        current_angle = self.joint_angles[joint_index]
+
+        # Positive shoulder-lift velocity raises the arm from
+        # the observed recovery configuration.
+        velocity = 0.05
 
         msg = JointJog()
+
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.joint_names = joint_names
+
+        velocities = [0.0] * len(joint_names)
+        velocities[joint_index] = velocity
+
         msg.velocities = velocities
+
         self.joint_pub.publish(msg)
 
-    def process_waypoints(self):
+        # Move only a small amount for this test.
+        return current_angle > -2.80
+
+    def calculate_position_velocity(self, target):
         '''
-        Description:    Timer function used to drive the tool through the waypoints.
+        Description:
+            Calculate a proportional Cartesian velocity command
+            to move the TCP toward the target position.
 
         Args:
+            target (tuple): Target x, y, z position in base_link.
+
         Returns:
+            tuple: Linear velocity vx, vy, vz and position error magnitude.
         '''
-        if self.arm_status is not None and 20 <= self.arm_status < 30:
-            self.handle_recovery()
-            return
 
-        if self.tcp_pose is None or self.joint_angles is None or self.arm_status is None:
-            return
+        # Current TCP position.
+        current_x = self.tcp_pose.position.x
+        current_y = self.tcp_pose.position.y
+        current_z = self.tcp_pose.position.z
 
-        if not self.unfolded:
-            self.unfold_step()
-            return
+        # Position error.
+        error_x = target[0] - current_x
+        error_y = target[1] - current_y
+        error_z = target[2] - current_z
 
-        if self.path_idx >= len(path_points):
-            self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            return
+        # Proportional gain.
+        kp = 0.2
 
-        target = path_points[self.path_idx]
-        is_real = path_is_real[self.path_idx]
-        pos_tolerance = 0.005 if is_real else 0.02  # via points: looser, just pass through
+        # Proportional velocity.
+        vx = kp * error_x
+        vy = kp * error_y
+        vz = kp * error_z
 
-        cx, cy, cz = self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z
-        ex, ey, ez = target[0] - cx, target[1] - cy, target[2] - cz
-        pos_error = math.sqrt(ex * ex + ey * ey + ez * ez)
+        # Magnitude of the velocity vector.
+        velocity_magnitude = math.sqrt(
+            vx * vx +
+            vy * vy +
+            vz * vz
+        )
 
-        Kp_lin = 0.2
-        vx, vy, vz = Kp_lin * ex, Kp_lin * ey, Kp_lin * ez
-        lin_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
-        if lin_mag > cap_linear_mps:
-            scale = (cap_linear_mps * 0.9) / lin_mag
-            vx, vy, vz = vx * scale, vy * scale, vz * scale
+        # Scale the whole vector if it exceeds the allowed limit.
+        if velocity_magnitude > cap_linear_mps:
 
-        wx = wy = wz = 0.0
-        if self.target_orientation is not None:
-            cur_q = [self.tcp_pose.orientation.x, self.tcp_pose.orientation.y,
-                     self.tcp_pose.orientation.z, self.tcp_pose.orientation.w]
-            tgt_q = [self.target_orientation.x, self.target_orientation.y,
-                     self.target_orientation.z, self.target_orientation.w]
-            r_err = Rotation.from_quat(tgt_q) * Rotation.from_quat(cur_q).inv()
-            rotvec = r_err.as_rotvec()
+            scale = (cap_linear_mps * 0.9) / velocity_magnitude
 
-            Kp_ang = 2.0
-            wx, wy, wz = Kp_ang * rotvec[0], Kp_ang * rotvec[1], Kp_ang * rotvec[2]
-            ang_mag = math.sqrt(wx * wx + wy * wy + wz * wz)
-            if ang_mag > cap_angular_rps:
-                scale = (cap_angular_rps * 0.9) / ang_mag
-                wx, wy, wz = wx * scale, wy * scale, wz * scale
+            vx *= scale
+            vy *= scale
+            vz *= scale
 
-        if pos_error < pos_tolerance:
-            if is_real:
-                if self.hold_start_time is None:
-                    self.hold_start_time = self.get_clock().now()
-                    self.get_logger().info(
-                        f'Reached real waypoint at path idx {
-                            self.path_idx}, holding')
-                elapsed = (self.get_clock().now() - self.hold_start_time).nanoseconds / 1e9
-                if elapsed >= 2.0:
-                    self.get_logger().info(f'Hold complete at path idx {self.path_idx}')
-                    self.last_safe_position = target
-                    self.path_idx += 1
-                    self.hold_start_time = None
-                self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        # Position error magnitude.
+        distance = math.sqrt(
+            error_x * error_x +
+            error_y * error_y +
+            error_z * error_z
+        )
+
+        return vx, vy, vz, distance
+
+    def process_waypoints(self):
+
+        if self.recovery_required:
+
+            self.twist_pub.publish(TwistStamped())
+
+            if self.unlock_future is None:
+
+                if self.unlock_client.service_is_ready():
+                    request = Trigger.Request()
+
+                    self.unlock_future = (
+                        self.unlock_client.call_async(request)
+                    )
+
+                    self.get_logger().warn(
+                        'Protective stop detected. Unlock request sent.'
+                    )
+
                 return
+
+            if not self.unlock_future.done():
+                return
+
+            response = self.unlock_future.result()
+            self.unlock_future = None
+
+            if response is not None and response.success:
+                self.get_logger().warn(
+                    'Protective stop unlocked. Switching to joint recovery.'
+                )
+
+                self.recovery_required = False
+                self.in_recovery = True
+                self.recovery_state = 'SWITCH_TO_JOINT'
+                self.switch_controller(joint_controller)
+
             else:
-                self.path_idx += 1
-        else:
-            self.hold_start_time = None
+                self.get_logger().error(
+                    'Protective stop unlock failed.'
+                )
 
-        self.publish_twist(vx, vy, vz, wx, wy, wz)
-
-    def publish_twist(self, vx, vy, vz, wx, wy, wz):
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = base_frame
-        msg.twist.linear.x = vx
-        msg.twist.linear.y = vy
-        msg.twist.linear.z = vz
-        msg.twist.angular.x = wx
-        msg.twist.angular.y = wy
-        msg.twist.angular.z = wz
-        self.twist_pub.publish(msg)
-
-    def handle_recovery(self):
-        if self.unlock_future is None:
-            if not self.unlock_cli.service_is_ready():
-                return
-            self.unlock_future = self.unlock_cli.call_async(Trigger.Request())
             return
-        if not self.unlock_future.done():
-            return
-        result = self.unlock_future.result()
-        self.unlock_future = None
-        if result is None or not result.success:
-            self.get_logger().error(f'Unlock failed: {result.message if result else "no result"}')
-            return
-        self.get_logger().warn(f'Unlocked: {result.message}')
 
-        if not self.recovery_controller_set:
-            if self.request_switch('joint_controller'):
-                self.recovery_controller_set = True
+        '''
+        Description:
+            Main control loop for the arm motion sequence.
+        '''
+
+        # Wait until all required feedback has been received.
+        if self.tcp_pose is None:
             return
 
         if self.joint_angles is None:
             return
 
-        Kp_joint = 0.4
-        velocities = []
-        max_err = 0.0
-        for name in joint_names:
-            idx = joint_names.index(name)
-            cur = self.joint_angles[idx]
-            tgt = self.unfold_target[name]
-            err = tgt - cur
-            max_err = max(max_err, abs(err))
-            v = Kp_joint * err
-            v = max(min(v, cap_joint_rps * 0.8), -cap_joint_rps * 0.8)
-            velocities.append(v)
-
-        if max_err < 0.1:
-            if self.request_switch('twist_controller'):
-                self.recovery_controller_set = False
-                self.get_logger().info('Recovered clear of singularity, resuming twist control')
+        if self.arm_status is None:
             return
 
-        msg = JointJog()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = joint_names
-        msg.velocities = velocities
-        self.joint_pub.publish(msg)
+        # ---------------------------------------------------------
+        # Check whether a controller switch is still in progress.
+        # ---------------------------------------------------------
+        if self.switch_future is not None:
+
+            if not self.switch_future.done():
+                return
+
+            response = self.switch_future.result()
+
+            self.switch_future = None
+
+            if response is None or not response.ok:
+                message = 'No response received' if response is None else response.message
+
+                self.get_logger().error(
+                    f'Failed to switch to {self.switch_target}: {message}'
+                )
+
+                self.motion_state = 'ERROR'
+                return
+
+            self.get_logger().info(
+                f'Switched to {self.switch_target}'
+            )
+
+            if self.switch_target == joint_controller:
+
+                if self.recovery_state == 'SWITCH_TO_JOINT':
+                    self.motion_state = 'RECOVERY'
+                    self.recovery_state = 'RECOVERY'
+                else:
+                    self.motion_state = 'UNFOLDING'
+
+            else:
+                self.motion_state = 'WAYPOINTS'
+
+            self.switch_target = None
+
+        # ---------------------------------------------------------
+        # Initial controller selection.
+        # ---------------------------------------------------------
+        if self.motion_state == 'INIT':
+
+            self.get_logger().info(
+                'Starting arm sequence: switching to joint controller'
+            )
+
+            self.motion_state = 'SWITCH_TO_JOINT'
+            self.switch_controller(joint_controller)
+            return
+
+        # ---------------------------------------------------------
+        # Unfold the arm.
+        # ---------------------------------------------------------
+        if self.motion_state == 'UNFOLDING':
+
+            if self.unfold_arm():
+                self.get_logger().info(
+                    'Unfolding complete. Switching to twist controller.'
+                )
+
+                self.motion_state = 'SWITCH_TO_TWIST'
+                self.switch_controller(twist_controller)
+
+            return
+
+        # ---------------------------------------------------------
+        # Recover from a protective stop.
+        # ---------------------------------------------------------
+        if self.motion_state == 'RECOVERY':
+
+            recovery_complete = self.recover_arm()
+
+            if self.arm_status == 0 and recovery_complete:
+
+                self.in_recovery = False
+                self.recovery_state = 'NONE'
+                self.motion_state = 'SWITCH_TO_TWIST'
+
+                self.switch_controller(twist_controller)
+
+                self.get_logger().warn(
+                    'Recovery complete. Switching back to twist controller.'
+                )
+
+                return
+
+        # ---------------------------------------------------------
+        # Waypoint motion will be implemented later.
+        # ---------------------------------------------------------
+
+        if self.motion_state == 'WAYPOINTS':
+
+            if self.path_idx >= len(path_points):
+                msg = TwistStamped()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = base_frame
+                self.twist_pub.publish(msg)
+                return
+
+            target = path_points[self.path_idx]
+
+            vx, vy, vz, distance = self.calculate_position_velocity(target)
+
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = base_frame
+
+            msg.twist.linear.x = vx
+            msg.twist.linear.y = vy
+            msg.twist.linear.z = vz
+
+            self.twist_pub.publish(msg)
+
+            if distance < position_tolerance:
+
+                if not self.holding:
+                    self.holding = True
+                    self.hold_start_time = self.get_clock().now()
+
+                elapsed = (
+                    self.get_clock().now() - self.hold_start_time
+                ).nanoseconds / 1e9
+
+                if elapsed >= 2.0:
+
+                    self.get_logger().warn(
+                        f'Waypoint {self.path_idx + 1} reached.'
+                    )
+
+                    self.path_idx += 1
+                    self.holding = False
+                    self.hold_start_time = None
+
+            else:
+                self.holding = False
+                self.hold_start_time = None
+
+            return
+
+        # ---------------------------------------------------------
+        # Error state.
+        # ---------------------------------------------------------
+        if self.motion_state == 'ERROR':
+            return
+
+##################### FUNCTION DEFINITION #######################
 
 
-def main():
-    '''
-    Description:    Main function which creates a ROS node and spins around for the
-                    arm_waypoints class to perform its task
-    '''
+def main(args=None):
+    rclpy.init(args=args)
 
-    rclpy.init(args=sys.argv)                                       # initialisation
+    node = rclpy.create_node('arm_waypoints_process')
+    node.get_logger().info('Node created: Arm waypoints process')
 
-    node = rclpy.create_node('arm_waypoints_process')               # creating ROS node
-
-    node.get_logger().info('Node created: Arm waypoints process')   # logging information
-
-    # creating a new object for class 'arm_waypoints'
     arm_waypoints_class = arm_waypoints()
 
-    # spining on the object to make it alive in ROS 2 DDS
+    arm_waypoints_class.get_logger().set_level(
+        rclpy.logging.LoggingSeverity.WARN
+    )
+
     rclpy.spin(arm_waypoints_class)
 
-    arm_waypoints_class.destroy_node()                              # destroy node after spin ends
-
-    rclpy.shutdown()                                                # shutdown process
+    arm_waypoints_class.destroy_node()
+    node.destroy_node()
+    rclpy.shutdown()                                              # shutdown process
 
 
 if __name__ == '__main__':
