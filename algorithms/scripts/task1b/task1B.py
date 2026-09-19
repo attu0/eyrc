@@ -18,15 +18,16 @@
 *****************************************************************************************
 '''
 
-# Team ID:          [ Team-ID ]
-# Author List:		[ Names of team members worked on this file separated by Comma: Name1, Name2, ... ]
-# Filename:		    task1b_boilerplate.py
+# Team ID:          [ 1449 ]
+# Author List:      [ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
+# Filename:\t\t    task1B.py
 # Functions:
-# [ Comma separated list of functions in this file ]
-# Nodes:		    Add your publishing and subscribing node
-#                   Example:
+#                 [ main, arm_waypoints.__init__, tcpposecb, jointstatecb,
+#                   armstatuscb, switch_controller, unfold_arm, recover_arm,
+#                   calculate_position_velocity, process_waypoints ]
+# Nodes:
 # Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
-#                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /etc... ]
+# Subscribing Topics - [ /tcp_pose_raw, /joint_states, /arm_status ]
 
 
 ################### IMPORT MODULES #######################
