@@ -1,550 +1,700 @@
 #!/usr/bin/env python3
 
+
 '''
+*****************************************************************************************
+*
+*            ===============================================
+*                       StrataCobot (SC) Theme (eYRC 2026-27)
+*            ===============================================
+*
+*  This script should be used to implement Task 1A of StrataCobot (SC) Theme (eYRC 2026-27).
+*
+*  This software is made available on an "AS IS WHERE IS BASIS".
+*  Licensee/end user indemnifies and will keep e-Yantra indemnified from
+*  any and all claim(s) that emanate from the use of the Software or
+*  breach of the terms of this agreement.
+*
+*****************************************************************************************
+'''
+
 # Team ID:          [ 1449 ]
-# Author List:		[ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
-# Filename:		    task1B.py
-# Functions:        __init__, tcpposecb, jointstatecb, armstatuscb, switch_controller,
-#                   request_switch, home_step, unfold_step, process_waypoints,
-#                   publish_twist, handle_recovery, main
-# Global variables: waypoints, path_points, path_is_real, servo_ns, twist_controller,
-#                   joint_controller, base_frame, joint_names, cap_linear_mps,
-#                   cap_angular_rps, cap_joint_rps, command_timeout_s
-# Nodes:		    Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds ]
-#                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /arm_status ]
-'''
+# Author List:      [ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
+# Filename:         task1A.py
+# Functions:        detect_ores, __init__, depthimagecb, colorimagecb,
+#                   caminfocb, process_image, main
+# Global variables: ore_types, color_topic, depth_topic,
+#                   camera_info_topic, base_frame
+# Nodes:             Publishing Topics  - [ /tf ]
+#                    Subscribing Topics - [ /camera/camera/color/image_raw,
+#                                           /camera/camera/aligned_depth_to_color/image_raw,
+#                                           /camera/camera/color/camera_info ]
+
+
+################### IMPORT MODULES #######################
 
 import rclpy
 import sys
-import math
+import cv2
+import tf2_ros
+import numpy as np
+
 from rclpy.node import Node
-from control_msgs.msg import JointJog
-from controller_manager_msgs.srv import SwitchController
-from geometry_msgs.msg import PoseStamped, TwistStamped
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Int32
-from std_srvs.srv import Trigger
-from scipy.spatial.transform import Rotation
+from cv_bridge import CvBridge, CvBridgeError
+from geometry_msgs.msg import PointStamped, TransformStamped
+from sensor_msgs.msg import CameraInfo, Image
+from tf2_geometry_msgs import do_transform_point
 
 
 ##################### TASK CONSTANTS #######################
 
-# Tool positions in base_link, in metres, in the order they must be reached.
-waypoints = [
-    (-0.4085, -0.5379, 0.1967),   # 1
-    (-0.8000, -0.0005, 0.3967),   # 2
-    (-0.7430,  0.5280, 0.1967),   # 3
-    (-0.4097,  0.5280, 0.1967),   # 4
-    (-0.0763,  0.5280, 0.1967),   # 5
+# Two ores of each type are spawned - six in all.
+# The ores are identified using IDs 1 and 2.
+ore_types = [
+    'azurite_ore',
+    'malachite_ore',
+    'vanadinite_ore'
 ]
 
-# Actual path driven: real waypoints (held 2s, scored) plus one via point that
-# rises in Z before moving laterally, avoiding a diagonal cut through the
-# +200mm gap between waypoints 1 and 2.
-path_points = [
-    waypoints[0],
-    (waypoints[0][0], waypoints[0][1], waypoints[1][2]),
-    waypoints[1],
-    waypoints[2],
-    waypoints[3],
-    waypoints[4],
-]
-path_is_real = [True, False, True, True, True, True]
+# RealSense colour image topic.
+color_topic = '/camera/camera/color/image_raw'
 
-servo_ns = '/ur_arm_controller'
-twist_controller = 'delta_twist_controller'
-joint_controller = 'delta_joint_controller'
+# RealSense depth image aligned with the colour image.
+depth_topic = '/camera/camera/aligned_depth_to_color/image_raw'
+
+# RealSense camera information topic.
+camera_info_topic = '/camera/camera/color/camera_info'
+
+# Parent frame for every ore transform.
 base_frame = 'base_link'
 
-joint_names = [
-    'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
-    'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint',
-]
 
-cap_linear_mps = 0.15
-cap_angular_rps = 0.35
-cap_joint_rps = 0.35
-command_timeout_s = 0.15
+##################### FUNCTION DEFINITIONS #######################
+
+def detect_ores(image):
+    '''
+    Description:
+        Detects ores present in a colour image and returns the center
+        pixel location and type of each detected ore.
+
+    Args:
+        image (numpy.ndarray):
+            Input colour image frame received from the camera topic.
+
+    Returns:
+        center_ore_list (list):
+            Center pixel coordinates (cX, cY) of every detected ore.
+
+        ore_type_list (list):
+            Type of each detected ore.
+    '''
+
+    ############ Function VARIABLES ############
+
+    center_ore_list = []
+    ore_type_list = []
+
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # HSV colour ranges for the three ore types.
+    color_bounds = {
+        'azurite_ore': ((95, 150, 100), (115, 255, 255)),
+        'malachite_ore': ((60, 150, 100), (90, 255, 255)),
+        'vanadinite_ore': ((0, 200, 180), (20, 255, 255))
+    }
+
+    for ore_type, (lower, upper) in color_bounds.items():
+
+        mask = cv2.inRange(
+            hsv,
+            np.array(lower),
+            np.array(upper)
+        )
+
+        # Remove small noise from the binary mask.
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            np.ones((5, 5), np.uint8)
+        )
+
+        # Fill small gaps inside detected regions.
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            np.ones((5, 5), np.uint8)
+        )
+
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+
+            # Ignore regions that are too small to be ores.
+            if cv2.contourArea(contour) < 150:
+                continue
+
+            moments = cv2.moments(contour)
+
+            # Protect against division by zero.
+            if moments['m00'] == 0:
+                continue
+
+            center_x = int(moments['m10'] / moments['m00'])
+            center_y = int(moments['m01'] / moments['m00'])
+
+            center_ore_list.append((center_x, center_y))
+            ore_type_list.append(ore_type)
+
+    return center_ore_list, ore_type_list
 
 
 ##################### CLASS DEFINITION #######################
 
-class arm_waypoints(Node):
+class ore_tf(Node):
     '''
     ___CLASS___
 
-    Description:    Class which serves the purpose to drive the UR7e's tool through the
-                    given waypoints using the arm's velocity command interfaces.
+    Description:
+        Class which serves the purpose of detecting ores in the cell
+        and broadcasting their positions as TF frames with respect
+        to the robot base frame.
     '''
 
     def __init__(self):
         '''
-        Description:    Initialization of class arm_waypoints
+        Description:
+            Initialization of class ore_tf.
         '''
 
-        super().__init__(
-            'arm_waypoints_node',
-            parameter_overrides=[rclpy.parameter.Parameter(
-                'use_sim_time', rclpy.Parameter.Type.BOOL, True)])
-
-        ############ Topic PUBLISHERS ############
-
-        self.twist_pub = self.create_publisher(TwistStamped, '/delta_twist_cmds', 10)
-        self.joint_pub = self.create_publisher(JointJog, '/delta_joint_cmds', 10)
+        super().__init__('ore_tf_publisher')
 
         ############ Topic SUBSCRIPTIONS ############
 
-        self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
-        self.joint_sub = self.create_subscription(
-            JointState, '/joint_states', self.jointstatecb, 50)
-        self.status_sub = self.create_subscription(Int32, '/arm_status', self.armstatuscb, 10)
+        self.color_cam_sub = self.create_subscription(
+            Image,
+            color_topic,
+            self.colorimagecb,
+            10
+        )
+
+        self.depth_cam_sub = self.create_subscription(
+            Image,
+            depth_topic,
+            self.depthimagecb,
+            10
+        )
+
+        self.cam_info_sub = self.create_subscription(
+            CameraInfo,
+            camera_info_topic,
+            self.caminfocb,
+            10
+        )
 
         ############ Constructor VARIABLES/OBJECTS ############
 
-        control_rate = 0.05
-        self.switch_cli = self.create_client(SwitchController, f'{servo_ns}/switch_controller')
-        self.unlock_cli = self.create_client(Trigger, f'{servo_ns}/unlock_protective_stop')
-        self.timer = self.create_timer(control_rate, self.process_waypoints)
+        # Time interval between image processing cycles.
+        image_processing_rate = 0.2
 
-        self.tcp_pose = None
-        self.joint_angles = None
-        self.arm_status = None
+        # CvBridge object used for ROS image conversion.
+        self.bridge = CvBridge()
 
-        # -- Non-blocking controller switch, polled from the timer --
-        self.switch_future = None
+        # TF buffer used for looking up camera-to-base transforms.
+        self.tf_buffer = tf2_ros.buffer.Buffer()
 
-        # -- Homing phase: drive to the documented start pose first, so every run
-        #    (fresh launch or not) begins from an identical configuration --
-        self.home_target = {
-            'shoulder_pan_joint': 0.0, 'shoulder_lift_joint': -0.523599,
-            'elbow_joint': -2.443461, 'wrist_1_joint': -0.174533,
-            'wrist_2_joint': 1.570796, 'wrist_3_joint': 1.570796,
-        }
-        self.homed = False
-        self.home_controller_set = False
+        # TF listener used to receive available transforms.
+        self.listener = tf2_ros.TransformListener(
+            self.tf_buffer,
+            self
+        )
 
-        # -- Unfold phase: move the elbow off its 20-degree-from-limit start pose
-        #    before any Cartesian motion, per the arm manual's guidance --
-        self.unfold_target = {
-            'shoulder_pan_joint': 0.0, 'shoulder_lift_joint': -1.20, 'elbow_joint': -1.60,
-            'wrist_1_joint': -1.90, 'wrist_2_joint': 1.57, 'wrist_3_joint': 1.57,
-        }
-        self.unfolded = False
-        self.unfold_controller_set = False
+        # TF broadcaster used to publish ore transforms.
+        self.br = tf2_ros.TransformBroadcaster(self)
 
-        # -- Waypoint tracking --
-        self.path_idx = 0
-        self.hold_start_time = None
-        self.target_orientation = None
-        self.last_safe_position = waypoints[0]
+        # Timer used to process the images periodically.
+        self.timer = self.create_timer(
+            image_processing_rate,
+            self.process_image
+        )
 
-        # -- Recovery from a latched critical fault --
-        self.recovering = False
-        self.unlock_future = None
-        self.unlock_done = False
-        self.recovery_controller_set = False
+        # Latest colour image.
+        self.cv_image = None
 
-    def tcpposecb(self, data):
+        # Latest depth image.
+        self.depth_image = None
+
+        # Latest camera intrinsic information.
+        self.cam_info = None
+
+        # Stores the last known pixel position of each ore ID.
+        self.ore_positions = {}
+
+        # Stores whether the detection image has already been saved.
+        self._saved_detection_image = False
+
+        # Stores whether the depth data type has already been logged.
+        self._logged_depth_dtype = False
+
+    def depthimagecb(self, data):
         '''
-        Description:    Callback function for the tool pose topic.
-                        Use this function to receive where the tool currently is.
+        Description:
+            Callback function for the aligned depth camera topic.
+            Converts the received ROS depth image into a NumPy array.
 
         Args:
-            data (PoseStamped):    Pose of the tool, reported in base_link
+            data (Image):
+                Input depth image received from the aligned depth
+                camera topic.
 
         Returns:
-        '''
-
-        self.tcp_pose = data.pose
-
-    def jointstatecb(self, data):
-        '''
-        Description:    Callback function for the joint states topic.
-                        Use this function to receive the current angle of each joint.
-
-        Args:
-            data (JointState):    Joint feedback published by the arm
-
-        Returns:
+            None
         '''
 
         try:
-            self.joint_angles = [data.position[data.name.index(j)] for j in joint_names]
-        except ValueError as e:
-            self.get_logger().warn(f'Joint name not found: {e}')
 
-    def armstatuscb(self, data):
+            depth = self.bridge.imgmsg_to_cv2(
+                data,
+                desired_encoding='passthrough'
+            )
+
+            if not self._logged_depth_dtype:
+                self.get_logger().info(
+                    f'Depth dtype: {depth.dtype}'
+                )
+                self._logged_depth_dtype = True
+
+            # Convert millimetres to metres when using 16-bit depth.
+            if depth.dtype == np.uint16:
+                depth = depth.astype(np.float32) / 1000.0
+
+            self.depth_image = depth
+
+        except CvBridgeError as error:
+            self.get_logger().error(
+                f'Depth image conversion failed: {error}'
+            )
+
+    def colorimagecb(self, data):
         '''
-        Description:    Callback function for the arm status topic.
-                        Use this function to receive the arm's current state code.
-                        A code in the critical tier (20-29) latches the arm and
-                        arms the recovery routine.
+        Description:
+            Callback function for the colour camera topic.
+            Converts the received ROS image into an OpenCV BGR image.
 
         Args:
-            data (Int32):    One state code describing what the arm is doing
+            data (Image):
+                Input colour image received from the camera topic.
 
         Returns:
+            None
         '''
 
-        if self.arm_status != data.data:
-            self.get_logger().info(f'Arm status changed: {data.data}')
-            if 20 <= data.data < 30:
-                self.recovering = True
-        self.arm_status = data.data
+        try:
 
-    def switch_controller(self, controller):
+            self.cv_image = self.bridge.imgmsg_to_cv2(
+                data,
+                desired_encoding='bgr8'
+            )
+
+        except CvBridgeError as error:
+            self.get_logger().error(
+                f'Color image conversion failed: {error}'
+            )
+
+    def caminfocb(self, data):
         '''
-        Description:    Blocking version of the controller switch. Safe to call only
-                        from __init__, before the node is spinning.
+        Description:
+            Callback function for the camera information topic.
+            Stores the camera intrinsic parameters required for
+            3D point calculation.
 
         Args:
-            controller  (str):      Name of the controller to activate, either
-                                    'twist_controller' or 'joint_controller'
+            data (CameraInfo):
+                Camera calibration information.
 
         Returns:
-            success     (bool):     Whether the controller was activated
+            None
         '''
 
-        target = twist_controller if controller == 'twist_controller' else joint_controller
-        other = joint_controller if controller == 'twist_controller' else twist_controller
+        self.cam_info = data.k
 
-        req = SwitchController.Request()
-        req.activate_controllers = [target]
-        req.deactivate_controllers = [other]
-        req.strictness = SwitchController.Request.STRICT
+        # Camera focal lengths.
+        self.fx = data.k[0]
+        self.fy = data.k[4]
 
-        if not self.switch_cli.wait_for_service(timeout_sec=20.0):
-            self.get_logger().error('switch_controller service not available')
-            return False
+        # Camera principal point.
+        self.cx = data.k[2]
+        self.cy = data.k[5]
 
-        future = self.switch_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-
-        if future.result() is None:
-            self.get_logger().warn('First switch_controller attempt failed, retrying')
-            future = self.switch_cli.call_async(req)
-            rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
-
-        return future.result() is not None and future.result().ok
-
-    def request_switch(self, controller):
+    def process_image(self):
         '''
-        Description:    Non-blocking version of the controller switch, safe to call
-                        every timer tick. Kicks off the service call on first use
-                        and polls it to completion on subsequent calls.
+        Description:
+            Timer function used to detect ores, calculate their
+            3D positions and publish their TF frames.
 
         Args:
-            controller  (str):      Name of the controller to activate, either
-                                    'twist_controller' or 'joint_controller'
+            None
 
         Returns:
-            done        (bool):     True once the switch has completed successfully;
-                                    False while pending or if it needs a retry.
+            None
         '''
 
-        if self.switch_future is not None:
-            if self.switch_future.done():
-                result = self.switch_future.result()
-                self.switch_future = None
-                if result is not None and result.ok:
-                    return True
-                self.get_logger().warn(f'switch_controller to {controller} failed, retrying')
-                return False
-            return False
+        ############ Check Required Data ############
 
-        target = twist_controller if controller == 'twist_controller' else joint_controller
-        other = joint_controller if controller == 'twist_controller' else twist_controller
-        req = SwitchController.Request()
-        req.activate_controllers = [target]
-        req.deactivate_controllers = [other]
-        req.strictness = SwitchController.Request.STRICT
-
-        if not self.switch_cli.service_is_ready():
-            return False
-
-        self.switch_future = self.switch_cli.call_async(req)
-        return False
-
-    def home_step(self):
-        '''
-        Description:    Drives the arm in joint space to the documented start pose,
-                        so every run begins from an identical configuration whether
-                        or not the simulation was freshly relaunched.
-
-        Args:
-        Returns:
-        '''
-
-        if not self.home_controller_set:
-            if self.request_switch('joint_controller'):
-                self.home_controller_set = True
+        # Return until a colour image is available.
+        if self.cv_image is None:
+            self.get_logger().info(
+                'Waiting for color image...'
+            )
             return
 
-        if self.joint_angles is None:
-            return
+        display = self.cv_image.copy()
 
-        Kp_joint = 0.5
-        velocities = []
-        max_err = 0.0
-        for name in joint_names:
-            idx = joint_names.index(name)
-            cur = self.joint_angles[idx]
-            tgt = self.home_target[name]
-            err = tgt - cur
-            max_err = max(max_err, abs(err))
-            v = Kp_joint * err
-            v = max(min(v, cap_joint_rps * 0.8), -cap_joint_rps * 0.8)
-            velocities.append(v)
+        # Detect all ores in the current colour frame.
+        center_ore_list, ore_type_list = detect_ores(
+            self.cv_image
+        )
 
-        if max_err < 0.03:
-            self.homed = True
-            self.get_logger().info('Homed to start pose')
-            return
+        ############ Group Detections by Type ############
 
-        msg = JointJog()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = joint_names
-        msg.velocities = velocities
-        self.joint_pub.publish(msg)
+        by_type = {}
 
-    def unfold_step(self):
-        '''
-        Description:    Drives the elbow off its 20-degree-from-limit start pose to
-                        a mid-range configuration in joint space, before any Cartesian
-                        motion is attempted.
+        for center, ore_type in zip(
+            center_ore_list,
+            ore_type_list
+        ):
+            by_type.setdefault(
+                ore_type,
+                []
+            ).append(center)
 
-        Args:
-        Returns:
-        '''
+        ############ Assign Stable Ore IDs ############
 
-        if not self.unfold_controller_set:
-            if self.request_switch('joint_controller'):
-                self.unfold_controller_set = True
-            return
+        all_assignments = []
 
-        if self.joint_angles is None:
-            return
+        for ore_type, detections in by_type.items():
 
-        Kp_joint = 0.6
-        velocities = []
-        max_err = 0.0
-        for name in joint_names:
-            idx = joint_names.index(name)
-            cur = self.joint_angles[idx]
-            tgt = self.unfold_target[name]
-            err = tgt - cur
-            max_err = max(max_err, abs(err))
-            v = Kp_joint * err
-            v = max(min(v, cap_joint_rps * 0.9), -cap_joint_rps * 0.9)
-            velocities.append(v)
+            candidate_ids = [
+                f'{ore_type}_1',
+                f'{ore_type}_2'
+            ]
 
-        if max_err < 0.03:
-            if self.request_switch('twist_controller'):
-                self.unfolded = True
-                self.target_orientation = self.tcp_pose.orientation
-                self.get_logger().info('Unfold complete, switching to twist control')
-            return
+            if len(detections) == 1:
 
-        msg = JointJog()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = joint_names
-        msg.velocities = velocities
-        self.joint_pub.publish(msg)
+                center_x, center_y = detections[0]
 
-    def process_waypoints(self):
-        '''
-        Description:    Timer function used to drive the tool through the waypoints.
-                        Runs, in order: recovery (if a fault latched), homing, unfold,
-                        then the Cartesian P-controller toward each waypoint in turn.
+                best_id = None
+                best_distance = float('inf')
 
-        Args:
-        Returns:
-        '''
+                for ore_id in candidate_ids:
 
-        if self.tcp_pose is None or self.joint_angles is None or self.arm_status is None:
-            return
+                    if ore_id in self.ore_positions:
 
-        if self.recovering:
-            self.handle_recovery()
-            return
+                        previous_x, previous_y = (
+                            self.ore_positions[ore_id]
+                        )
 
-        if not self.homed:
-            self.home_step()
-            return
+                        distance = (
+                            (previous_x - center_x) ** 2 +
+                            (previous_y - center_y) ** 2
+                        )
 
-        if not self.unfolded:
-            self.unfold_step()
-            return
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_id = ore_id
 
-        if self.path_idx >= len(path_points):
-            self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-            return
+                if best_id is None:
+                    best_id = candidate_ids[0]
 
-        target = path_points[self.path_idx]
-        is_real = path_is_real[self.path_idx]
-        pos_tolerance = 0.005 if is_real else 0.02  # via points: looser, just pass through
+                assignment = [
+                    (best_id, (center_x, center_y))
+                ]
 
-        cx, cy, cz = self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z
-        ex, ey, ez = target[0] - cx, target[1] - cy, target[2] - cz
-        pos_error = math.sqrt(ex * ex + ey * ey + ez * ez)
+            elif len(detections) >= 2:
 
-        # Creep in slowly near any target -- avoids carrying speed into the final
-        # few centimetres, which is what drives overshoot past a waypoint.
-        Kp_lin = 0.2
-        vx, vy, vz = Kp_lin * ex, Kp_lin * ey, Kp_lin * ez
-        lin_mag = math.sqrt(vx * vx + vy * vy + vz * vz)
-        close_range = 0.10
-        close_speed_cap = 0.03
-        effective_cap = close_speed_cap if pos_error < close_range else cap_linear_mps
-        if lin_mag > effective_cap:
-            scale = (effective_cap * 0.9) / lin_mag
-            vx, vy, vz = vx * scale, vy * scale, vz * scale
+                detection_1 = detections[0]
+                detection_2 = detections[1]
 
-        wx = wy = wz = 0.0
-        if self.target_orientation is not None:
-            cur_q = [self.tcp_pose.orientation.x, self.tcp_pose.orientation.y,
-                     self.tcp_pose.orientation.z, self.tcp_pose.orientation.w]
-            tgt_q = [self.target_orientation.x, self.target_orientation.y,
-                     self.target_orientation.z, self.target_orientation.w]
-            r_err = Rotation.from_quat(tgt_q) * Rotation.from_quat(cur_q).inv()
-            rotvec = r_err.as_rotvec()
+                known_ids = [
+                    ore_id
+                    for ore_id in candidate_ids
+                    if ore_id in self.ore_positions
+                ]
 
-            Kp_ang = 1.0
-            wx, wy, wz = Kp_ang * rotvec[0], Kp_ang * rotvec[1], Kp_ang * rotvec[2]
-            ang_mag = math.sqrt(wx * wx + wy * wy + wz * wz)
-            ang_cap = 0.05 if pos_error < 0.15 else cap_angular_rps
-            if ang_mag > ang_cap:
-                scale = (ang_cap * 0.9) / ang_mag
-                wx, wy, wz = wx * scale, wy * scale, wz * scale
+                if len(known_ids) == 2:
 
-        if pos_error < pos_tolerance:
-            if is_real:
-                if self.hold_start_time is None:
-                    self.hold_start_time = self.get_clock().now()
-                    self.get_logger().info(f'Reached real waypoint at path idx {self.path_idx}, holding')
-                elapsed = (self.get_clock().now() - self.hold_start_time).nanoseconds / 1e9
-                if elapsed >= 2.0:
-                    self.get_logger().info(f'Hold complete at path idx {self.path_idx}')
-                    self.last_safe_position = target
-                    self.path_idx += 1
-                    self.hold_start_time = None
-                self.publish_twist(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-                return
+                    id_1, id_2 = candidate_ids
+
+                    position_1 = self.ore_positions[id_1]
+                    position_2 = self.ore_positions[id_2]
+
+                    cost_a = (
+                        (position_1[0] - detection_1[0]) ** 2 +
+                        (position_1[1] - detection_1[1]) ** 2 +
+                        (position_2[0] - detection_2[0]) ** 2 +
+                        (position_2[1] - detection_2[1]) ** 2
+                    )
+
+                    cost_b = (
+                        (position_2[0] - detection_1[0]) ** 2 +
+                        (position_2[1] - detection_1[1]) ** 2 +
+                        (position_1[0] - detection_2[0]) ** 2 +
+                        (position_1[1] - detection_2[1]) ** 2
+                    )
+
+                    if cost_a <= cost_b:
+                        assignment = [
+                            (id_1, detection_1),
+                            (id_2, detection_2)
+                        ]
+                    else:
+                        assignment = [
+                            (id_2, detection_1),
+                            (id_1, detection_2)
+                        ]
+
+                elif len(known_ids) == 1:
+
+                    known_id = known_ids[0]
+
+                    if known_id == candidate_ids[0]:
+                        other_id = candidate_ids[1]
+                    else:
+                        other_id = candidate_ids[0]
+
+                    previous_position = self.ore_positions[known_id]
+
+                    distance_1 = (
+                        (previous_position[0] - detection_1[0]) ** 2 +
+                        (previous_position[1] - detection_1[1]) ** 2
+                    )
+
+                    distance_2 = (
+                        (previous_position[0] - detection_2[0]) ** 2 +
+                        (previous_position[1] - detection_2[1]) ** 2
+                    )
+
+                    if distance_1 <= distance_2:
+                        assignment = [
+                            (known_id, detection_1),
+                            (other_id, detection_2)
+                        ]
+                    else:
+                        assignment = [
+                            (known_id, detection_2),
+                            (other_id, detection_1)
+                        ]
+
+                else:
+
+                    assignment = [
+                        (candidate_ids[0], detection_1),
+                        (candidate_ids[1], detection_2)
+                    ]
+
             else:
-                self.path_idx += 1
-        else:
-            self.hold_start_time = None
 
-        self.publish_twist(vx, vy, vz, wx, wy, wz)
+                assignment = []
 
-    def publish_twist(self, vx, vy, vz, wx, wy, wz):
-        '''
-        Description:    Builds and publishes a TwistStamped on the end-effector
-                        servoing topic.
+            for ore_id, (center_x, center_y) in assignment:
 
-        Args:
-            vx, vy, vz  (float):   Linear velocity of tcp in base_link, m/s
-            wx, wy, wz  (float):   Angular velocity of the tool about base_link
-                                    axes, rad/s
+                self.ore_positions[ore_id] = (
+                    center_x,
+                    center_y
+                )
 
-        Returns:
-        '''
+                all_assignments.append(
+                    (ore_id, center_x, center_y)
+                )
 
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = base_frame
-        msg.twist.linear.x = vx
-        msg.twist.linear.y = vy
-        msg.twist.linear.z = vz
-        msg.twist.angular.x = wx
-        msg.twist.angular.y = wy
-        msg.twist.angular.z = wz
-        self.twist_pub.publish(msg)
+        ############ Draw Detected Ores ############
 
-    def handle_recovery(self):
-        '''
-        Description:    Clears a latched critical fault: unlocks the protective stop
-                        once, then drives the arm in joint space back toward the
-                        unfold pose (well-conditioned, away from the singular or
-                        limit-adjacent configuration that likely caused the fault)
-                        before resuming Cartesian control.
+        for ore_id, center_x, center_y in all_assignments:
 
-        Args:
-        Returns:
-        '''
+            cv2.circle(
+                display,
+                (center_x, center_y),
+                8,
+                (255, 255, 255),
+                2
+            )
 
-        if not self.unlock_done:
-            if self.unlock_future is None:
-                if not self.unlock_cli.service_is_ready():
-                    return
-                self.unlock_future = self.unlock_cli.call_async(Trigger.Request())
-                return
-            if not self.unlock_future.done():
-                return
-            result = self.unlock_future.result()
-            self.unlock_future = None
-            if result is None or not result.success:
-                self.get_logger().error(f'Unlock failed: {result.message if result else "no result"}')
-                return
-            self.get_logger().warn(f'Unlocked: {result.message}')
-            self.unlock_done = True
-            return
+            cv2.putText(
+                display,
+                ore_id,
+                (center_x - 40, center_y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA
+            )
 
-        if not self.recovery_controller_set:
-            if self.request_switch('joint_controller'):
-                self.recovery_controller_set = True
-            return
+        cv2.imshow(
+            'color_feed',
+            display
+        )
 
-        if self.joint_angles is None:
-            return
+        cv2.waitKey(1)
 
-        Kp_joint = 0.4
-        velocities = []
-        max_err = 0.0
-        for name in joint_names:
-            idx = joint_names.index(name)
-            cur = self.joint_angles[idx]
-            tgt = self.unfold_target[name]
-            err = tgt - cur
-            max_err = max(max_err, abs(err))
-            v = Kp_joint * err
-            v = max(min(v, cap_joint_rps * 0.8), -cap_joint_rps * 0.8)
-            velocities.append(v)
+        ############ Save Detection Image ############
 
-        if max_err < 0.1:
-            if self.request_switch('twist_controller'):
-                self.recovery_controller_set = False
-                self.unlock_done = False
-                self.recovering = False
-                self.get_logger().info('Recovered clear of singularity, resuming twist control')
-            return
+        if (
+            not self._saved_detection_image
+            and len(all_assignments) == 6
+        ):
 
-        msg = JointJog()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.joint_names = joint_names
-        msg.velocities = velocities
-        self.joint_pub.publish(msg)
+            save_result = cv2.imwrite(
+                'SC#1449_task1A_detection.png',
+                display
+            )
+
+            self._saved_detection_image = True
+
+            self.get_logger().info(
+                f'Detection image save result: {save_result}'
+            )
+
+        ############ Broadcast Ore TF ############
+
+        if (
+            self.depth_image is not None
+            and hasattr(self, 'fx')
+        ):
+
+            cam_frame_id = 'camera_color_optical_frame'
+
+            current_time = self.get_clock().now().to_msg()
+
+            for ore_id, center_x, center_y in all_assignments:
+
+                # Extract a 9x9 depth window around the ore center.
+                patch = self.depth_image[
+                    max(center_y - 4, 0):center_y + 5,
+                    max(center_x - 4, 0):center_x + 5
+                ]
+
+                # Keep only valid depth measurements.
+                valid_depth = patch[
+                    np.isfinite(patch) &
+                    (patch > 0.0)
+                ]
+
+                if valid_depth.size == 0:
+                    continue
+
+                # Median depth provides a more stable measurement.
+                depth = float(
+                    np.median(valid_depth)
+                )
+
+                # Deproject the pixel into the camera optical frame.
+                x = (
+                    (center_x - self.cx) *
+                    depth /
+                    self.fx
+                )
+
+                y = (
+                    (center_y - self.cy) *
+                    depth /
+                    self.fy
+                )
+
+                z = depth
+
+                ############ Transform Point to Base Frame ############
+
+                point_in_camera = PointStamped()
+
+                point_in_camera.header.frame_id = cam_frame_id
+                point_in_camera.header.stamp = (
+                    rclpy.time.Time().to_msg()
+                )
+
+                point_in_camera.point.x = x
+                point_in_camera.point.y = y
+                point_in_camera.point.z = z
+
+                try:
+
+                    transform = self.tf_buffer.lookup_transform(
+                        base_frame,
+                        cam_frame_id,
+                        rclpy.time.Time()
+                    )
+
+                    point_in_base = do_transform_point(
+                        point_in_camera,
+                        transform
+                    )
+
+                except Exception as error:
+
+                    self.get_logger().warn(
+                        f'TF lookup failed for {ore_id}: {error}'
+                    )
+
+                    continue
+
+                base_x = point_in_base.point.x
+                base_y = point_in_base.point.y
+                base_z = point_in_base.point.z
+
+                ############ Publish Transform ############
+
+                transform_msg = TransformStamped()
+
+                transform_msg.header.stamp = current_time
+                transform_msg.header.frame_id = base_frame
+                transform_msg.child_frame_id = ore_id
+
+                transform_msg.transform.translation.x = float(base_x)
+                transform_msg.transform.translation.y = float(base_y)
+                transform_msg.transform.translation.z = float(base_z)
+
+                transform_msg.transform.rotation.w = 1.0
+
+                self.br.sendTransform(
+                    transform_msg
+                )
 
 
 ##################### FUNCTION DEFINITION #######################
 
 def main():
     '''
-    Description:    Main function which creates a ROS node and spins around for the
-                    arm_waypoints class to perform its task
+    Description:
+        Main function which creates a ROS node and spins around for
+        the ore_tf class to perform its task.
+
+    Args:
+        None
+
+    Returns:
+        None
     '''
 
     rclpy.init(args=sys.argv)
 
-    node = rclpy.create_node('arm_waypoints_process')
+    node = rclpy.create_node(
+        'ore_tf_process'
+    )
 
-    node.get_logger().info('Node created: Arm waypoints process')
+    node.get_logger().info(
+        'Node created: Ore tf process'
+    )
 
-    arm_waypoints_class = arm_waypoints()
+    ore_tf_class = ore_tf()
 
-    rclpy.spin(arm_waypoints_class)
+    rclpy.spin(
+        ore_tf_class
+    )
 
-    arm_waypoints_class.destroy_node()
+    ore_tf_class.destroy_node()
 
     rclpy.shutdown()
 
