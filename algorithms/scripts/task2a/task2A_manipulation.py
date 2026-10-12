@@ -4,27 +4,29 @@
 StrataCobot (SC) Theme (eYRC 2026-27)
 Task 2A - Ore manipulation
 
-This node combines the Task 1B UR7e velocity-control approach with:
-  - TF lookup of ore positions published by Task 2A perception
-  - magnet service control
-  - force-based grasp verification
-  - pick -> lift -> transport -> drop sequencing
+Picks every ore found by the perception node with the magnet and drops it in the
+container for its kind. Velocity control only (no motion-planning package).
 
-No motion-planning package is used.
+Per ore:  HOVER (level, safe height) -> APPROACH -> DESCEND -> magnet ON -> VERIFY ->
+          LIFT (vertical) -> TRANSIT (level) -> DROP_APPROACH -> DROP_DESCEND ->
+          magnet OFF -> DROP_SETTLE -> DROP_RETREAT (vertical) -> next ore
 '''
 
-import rclpy
-import sys
 import math
+import re
+import sys
+
+import rclpy
 import tf2_ros
 
-from rclpy.node import Node
 from control_msgs.msg import JointJog
 from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import PoseStamped, TwistStamped
+from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Int32, Float32
-from std_srvs.srv import Trigger, SetBool
+from std_msgs.msg import Float32, Int32, String
+from std_srvs.srv import SetBool, Trigger
 
 
 # ------------------------- TASK CONSTANTS -------------------------
@@ -44,27 +46,43 @@ joint_names = [
     'wrist_3_joint',
 ]
 
-# Task 1B container/tool positions, in base_link.
+# Container drop positions in base_link.
 DROP_POINTS = {
     'azurite_ore': (-0.0700, 0.5500, 0.1500),
     'malachite_ore': (-0.4000, 0.5500, 0.1500),
     'vanadinite_ore': (-0.6500, 0.5500, 0.1500),
 }
 
-# Four ores expected in Task 2A.
-ORE_ORDER = [
-    'azurite_ore_1',
-    'azurite_ore_2',
-    'malachite_ore_1',
-    'vanadinite_ore_1',
-]
+ORE_RE = re.compile(r'^(azurite|malachite|vanadinite)_ore_\d+$')
 
-# The tool first approaches above the ore, then descends for capture.
+EXPECTED_ORES = 4
+WAIT_ORES_TIMEOUT_S = 20.0
+IDLE_WAIT_S = 15.0
+
+# Heights above the ore TF.
+HOVER_HEIGHT = 0.18
 APPROACH_HEIGHT = 0.08
-# The detected TF is slightly above/below the visual centre depending on the
-# depth patch. Move 20 mm lower than the previous +15 mm pick target.
-PICK_OFFSET_Z = -0.005
+PICK_OFFSET_Z = -0.002
+# Extra z offsets tried on successive pick attempts.
+PICK_Z_TRIES = (0.0, -0.002, 0.002)
+# A pick is never skipped for a bad force reading: the arm keeps trying, nudging
+# the tool around the detected position each time, and re-detects the ore after
+# every failure. Only after MAX_PICK_ATTEMPTS is the ore left for a later round.
+MAX_PICK_ATTEMPTS = 10
+MAX_RETRY_ROUNDS = 2
+SEARCH_OFFSETS = (
+    (0.0, 0.0), (0.005, 0.0), (-0.005, 0.0), (0.0, 0.005), (0.0, -0.005),
+    (0.010, 0.0), (-0.010, 0.0), (0.0, 0.010), (0.0, -0.010),
+    (0.005, 0.005), (-0.005, -0.005),
+)
+# After touching something, back off this far before switching the magnet on.
+CONTACT_BACKOFF_M = 0.004
+RESCAN_TIMEOUT_S = 8.0
 LIFT_HEIGHT = 0.16
+
+# Protective stops are codes 20 to 23.
+PROTECTIVE_STOP_CODES = (20, 21, 22, 23)
+MAX_STOPS_PER_ORE = 2
 
 cap_linear_mps = 0.15
 cap_angular_rps = 0.35
@@ -79,27 +97,70 @@ unfold_target = {
     'wrist_3_joint': 1.57,
 }
 
-position_tolerance = 0.005
-unfold_kp = 0.6
+unfold_kp = 1.0
 control_rate = 0.05
 
-# Grasp verification. Keep this as a constant so it is easy to tune
-# against the force values reported by the Task 2A simulation.
-FORCE_THRESHOLD_N = 0.20
-FORCE_WAIT_S = 1.5
+# Position tolerances (m).
+position_tolerance = 0.005
+TOL_FINE = 0.008
+TOL_COARSE = 0.015
 
-# Time to allow the magnet service to complete and the ore to settle.
-MAGNET_SETTLE_S = 0.5
-DROP_SETTLE_S = 0.8
+# Speed profiles (kp, max m/s). All maxima stay below cap_linear_mps.
+TRAVEL_KP, TRAVEL_SPEED = 1.5, 0.135
+APPROACH_KP, APPROACH_SPEED = 1.5, 0.13
+DESCEND_KP, DESCEND_SPEED = 1.5, 0.07
+LIFT_KP, LIFT_SPEED = 1.5, 0.09
+TRANSPORT_KP, TRANSPORT_MAX_SPEED = 1.5, 0.11
+DROP_KP, DROP_MAX_SPEED = 1.5, 0.10
+DROP_DESCEND_SPEED = 0.06
 
-# Safe transport path while the ore is held.
-# The arm must pass through waypoint #2 before approaching the container.
-TRANSPORT_WAYPOINT = (-0.8000, -0.0005, 0.3967)
-TRANSPORT_KP = 0.10
-TRANSPORT_MAX_SPEED = 0.08
-DROP_KP = 0.10
-DROP_MAX_SPEED = 0.08
+MOVE_TIMEOUT_S = 40.0
+
+# Grasp verification.
+# A held ore reads about 1.47 N (measured). Accept a steady reading in this band.
+FORCE_HELD_MIN_N = 0.8
+FORCE_HELD_MAX_N = 2.5
+FORCE_STABLE_RANGE_N = 0.15
+FORCE_STABLE_WINDOW_S = 0.3
+# Stop descending if the tool presses on the ore/conveyor this hard.
+CONTACT_FORCE_N = 4.0
+FORCE_WAIT_S = 2.0
+MAGNET_SETTLE_S = 0.4
+DROP_SETTLE_S = 0.5
+
+# Safe height (base_link z) for all horizontal moves. The arm only ever moves
+# vertically near the ore and the container, and level at this height in between.
+TRAVEL_Z = 0.30
+
+# Path planning around the arm's own base. A level move whose straight line passes
+# closer than R_CLEAR to the base axis is replaced by an arc of radius R_ARC that
+# goes round the back (x < 0) of the base.
+R_CLEAR = 0.25
+R_ARC = 0.60
+ARC_STEP_DEG = 30.0
+TOL_ARC = 0.04
 DROP_APPROACH_HEIGHT = 0.10
+
+# Tool orientation: keep the tool's pointing axis straight down so the magnet face
+# lies flat on the ore. The axis is found automatically (the tcp axis closest to
+# straight down once the arm is unfolded).
+ANG_KP = 1.5
+ANG_MAX_RPS = 0.25
+LEVEL_TOL_RAD = 0.01
+LEVEL_TIMEOUT_S = 20.0
+
+
+def quat_to_matrix(q):
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    s = 2.0 / n
+    return [
+        [1 - s * (y * y + z * z), s * (x * y - z * w), s * (x * z + y * w)],
+        [s * (x * y + z * w), 1 - s * (x * x + z * z), s * (y * z - x * w)],
+        [s * (x * z - y * w), s * (y * z + x * w), 1 - s * (x * x + y * y)],
+    ]
 
 
 class arm_task2a(Node):
@@ -108,22 +169,14 @@ class arm_task2a(Node):
         super().__init__(
             'task2a_manipulation',
             parameter_overrides=[
-                rclpy.parameter.Parameter(
-                    'use_sim_time',
-                    rclpy.Parameter.Type.BOOL,
-                    True
-                )
+                Parameter('use_sim_time', Parameter.Type.BOOL, True)
             ]
         )
 
         # ------------------------- PUBLISHERS -------------------------
 
-        self.twist_pub = self.create_publisher(
-            TwistStamped, '/delta_twist_cmds', 10
-        )
-        self.joint_pub = self.create_publisher(
-            JointJog, '/delta_joint_cmds', 10
-        )
+        self.twist_pub = self.create_publisher(TwistStamped, '/delta_twist_cmds', 10)
+        self.joint_pub = self.create_publisher(JointJog, '/delta_joint_cmds', 10)
 
         # ------------------------- SUBSCRIBERS -------------------------
 
@@ -136,35 +189,28 @@ class arm_task2a(Node):
         self.status_sub = self.create_subscription(
             Int32, '/arm_status', self.armstatuscb, 10
         )
+        self.rescan_pub = self.create_publisher(String, '/ore_rescan', 10)
+        self.rescan_done_sub = self.create_subscription(
+            String, '/ore_rescan_done', self.rescandonecb, 10
+        )
         self.force_sub = self.create_subscription(
-            Float32,
-            '/ur7e/end_effector/force_magnitude',
-            self.forcecb,
-            20
+            Float32, '/ur7e/end_effector/force_magnitude', self.forcecb, 20
         )
 
         # ------------------------- SERVICES -------------------------
 
         self.switch_cli = self.create_client(
-            SwitchController,
-            f'{servo_ns}/switch_controller'
+            SwitchController, f'{servo_ns}/switch_controller'
         )
         self.unlock_client = self.create_client(
-            Trigger,
-            '/ur_arm_controller/unlock_protective_stop'
+            Trigger, '/ur_arm_controller/unlock_protective_stop'
         )
-        self.magnet_client = self.create_client(
-            SetBool,
-            '/magnet'
-        )
+        self.magnet_client = self.create_client(SetBool, '/magnet')
 
         # ------------------------- TF -------------------------
 
         self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(
-            self.tf_buffer,
-            self
-        )
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ------------------------- FEEDBACK -------------------------
 
@@ -176,43 +222,53 @@ class arm_task2a(Node):
         # ------------------------- STATE -------------------------
 
         self.motion_state = 'INIT'
+        self.phase = None
+        self.phase_start_time = None
+        self.start_time = None
 
+        self.active_controller = None
         self.switch_future = None
         self.switch_target = None
+        self.switch_retries = 0
 
         self.unlock_future = None
         self.recovery_required = False
         self.in_recovery = False
-        self.recovery_state = 'NONE'
-
         self.unfolded = False
+        self.recover_target = None
 
-        self.ore_index = 0
+        self.magnet_future = None
+        self.magnet_request = None
+        self.magnet_target = None
+        self.magnet_reason = None
+
+        self.done_ores = set()
+        self.skipped_ores = set()
+        self.stop_counts = {}
+        self.idle_start = None
+
         self.current_ore = None
         self.current_ore_position = None
         self.current_drop_position = None
-        self.transport_waypoint = TRANSPORT_WAYPOINT
-        self.transport_phase = None
-
-        self.hold_start_time = None
-        self.magnet_future = None
-        self.magnet_target = None
-        self.magnet_on_time = None
-
+        self.pick_attempt = 0
         self.force_baseline = None
-        self.force_wait_start = None
+        self.force_hist = []
+        self.pick_attempts = {}
+        self.tool_axis = None
+        self.ang_sign = 1.0
+        self.level_tilt0 = None
+        self.level_checked = False
+        self.retry_rounds = 0
+        self.retry_target = None
+        self.backoff_target = None
+        self.rescan_done = False
+        self.rescan_last = -100.0
+        self.path = None
+        self.path_idx = 0
 
-        self.phase = None
-        self.phase_start_time = None
+        self.timer = self.create_timer(control_rate, self.process)
 
-        self.timer = self.create_timer(
-            control_rate,
-            self.process
-        )
-
-        self.get_logger().info(
-            'Task 2A manipulation node started.'
-        )
+        self.get_logger().info('Task 2A manipulation node started.')
 
     # ------------------------- CALLBACKS -------------------------
 
@@ -222,8 +278,7 @@ class arm_task2a(Node):
     def jointstatecb(self, data):
         try:
             self.joint_angles = [
-                data.position[data.name.index(joint)]
-                for joint in joint_names
+                data.position[data.name.index(joint)] for joint in joint_names
             ]
         except (ValueError, IndexError):
             self.joint_angles = None
@@ -231,12 +286,18 @@ class arm_task2a(Node):
     def armstatuscb(self, data):
         self.arm_status = data.data
 
-        if 20 <= self.arm_status <= 29:
-            if not self.in_recovery:
-                self.recovery_required = True
+        if self.arm_status in PROTECTIVE_STOP_CODES and not self.in_recovery:
+            self.recovery_required = True
+
+    def rescandonecb(self, data):
+        if data.data == self.current_ore:
+            self.rescan_done = True
 
     def forcecb(self, data):
         self.force_magnitude = float(data.data)
+        now = self.now_seconds()
+        self.force_hist.append((now, self.force_magnitude))
+        self.force_hist = [(t, f) for t, f in self.force_hist if now - t <= 3.0]
 
     # ------------------------- BASIC HELPERS -------------------------
 
@@ -252,118 +313,259 @@ class arm_task2a(Node):
     def set_phase(self, phase):
         self.phase = phase
         self.phase_start_time = self.now_seconds()
-        self.get_logger().info(
-            f'Ore={self.current_ore}, phase={phase}'
-        )
+        self.get_logger().info(f'Ore={self.current_ore}, phase={phase}')
 
     def phase_elapsed(self):
         if self.phase_start_time is None:
             return 0.0
         return self.now_seconds() - self.phase_start_time
 
-    def calculate_position_velocity(self, target):
-        current_x = self.tcp_pose.position.x
-        current_y = self.tcp_pose.position.y
-        current_z = self.tcp_pose.position.z
-
-        error_x = target[0] - current_x
-        error_y = target[1] - current_y
-        error_z = target[2] - current_z
-
-        kp = 0.20
+    def publish_slow_twist_to(self, target, kp, max_speed, hold_speed=False):
+        error_x = target[0] - self.tcp_pose.position.x
+        error_y = target[1] - self.tcp_pose.position.y
+        error_z = target[2] - self.tcp_pose.position.z
 
         vx = kp * error_x
         vy = kp * error_y
         vz = kp * error_z
 
-        magnitude = math.sqrt(
-            vx * vx + vy * vy + vz * vz
-        )
-
-        if magnitude > cap_linear_mps:
-            scale = (cap_linear_mps * 0.9) / magnitude
-            vx *= scale
-            vy *= scale
-            vz *= scale
-
-        distance = math.sqrt(
-            error_x * error_x +
-            error_y * error_y +
-            error_z * error_z
-        )
-
-        return vx, vy, vz, distance
-
-    def publish_twist_to(self, target):
-        vx, vy, vz, distance = self.calculate_position_velocity(target)
-
-        msg = TwistStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = base_frame
-        msg.twist.linear.x = vx
-        msg.twist.linear.y = vy
-        msg.twist.linear.z = vz
-
-        self.twist_pub.publish(msg)
-        return distance
-
-    def publish_slow_twist_to(self, target, kp=0.10, max_speed=0.08):
-        current_x = self.tcp_pose.position.x
-        current_y = self.tcp_pose.position.y
-        current_z = self.tcp_pose.position.z
-
-        error_x = target[0] - current_x
-        error_y = target[1] - current_y
-        error_z = target[2] - current_z
-
-        vx = kp * error_x
-        vy = kp * error_y
-        vz = kp * error_z
-
+        max_speed = min(max_speed, cap_linear_mps * 0.9)
         magnitude = math.sqrt(vx * vx + vy * vy + vz * vz)
-        if magnitude > max_speed:
+
+        if magnitude > max_speed or (hold_speed and magnitude > 1e-9):
             scale = max_speed / magnitude
             vx *= scale
             vy *= scale
             vz *= scale
 
-        distance = math.sqrt(
-            error_x * error_x + error_y * error_y + error_z * error_z
-        )
-
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = base_frame
         msg.twist.linear.x = vx
         msg.twist.linear.y = vy
         msg.twist.linear.z = vz
+
+        wx, wy, wz = self.orientation_rate()
+        msg.twist.angular.x = wx
+        msg.twist.angular.y = wy
+        msg.twist.angular.z = wz
+
         self.twist_pub.publish(msg)
-        return distance
+
+        return math.sqrt(error_x ** 2 + error_y ** 2 + error_z ** 2)
+
+    def choose_tool_axis(self):
+        R = quat_to_matrix(self.tcp_pose.orientation)
+        best = None
+        for idx in range(3):
+            for sign in (1.0, -1.0):
+                down = -sign * R[2][idx]
+                if best is None or down > best[0]:
+                    best = (down, idx, sign)
+        self.tool_axis = (best[1], best[2])
+
+    def tool_vector(self):
+        R = quat_to_matrix(self.tcp_pose.orientation)
+        idx, sign = self.tool_axis
+        return (sign * R[0][idx], sign * R[1][idx], sign * R[2][idx])
+
+    def tool_tilt(self):
+        """Angle (rad) between the tool axis and straight down."""
+        v = self.tool_vector()
+        return math.acos(max(-1.0, min(1.0, -v[2])))
+
+    def orientation_rate(self):
+        """Angular velocity (base frame) that turns the tool axis toward straight down."""
+        if self.tool_axis is None:
+            return (0.0, 0.0, 0.0)
+
+        vx, vy, _ = self.tool_vector()
+        wx = self.ang_sign * ANG_KP * (-vy)
+        wy = self.ang_sign * ANG_KP * vx
+
+        mag = math.hypot(wx, wy)
+        if mag > ANG_MAX_RPS:
+            wx *= ANG_MAX_RPS / mag
+            wy *= ANG_MAX_RPS / mag
+
+        return (wx, wy, 0.0)
+
+    def go(self, target, kp, max_speed, tol):
+        '''Drive the tool toward target. True when reached (or timed out).'''
+
+        distance = self.publish_slow_twist_to(target, kp, max_speed)
+
+        if distance < tol:
+            self.stop_twist()
+            return True
+
+        if self.phase_elapsed() > MOVE_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Move timeout in phase {self.phase}; continuing '
+                f'(remaining {distance:.3f} m).'
+            )
+            self.stop_twist()
+            return True
+
+        return False
+
+    # ------------------------- PATHS AROUND THE BASE -------------------------
+
+    def plan_path_xy(self, start, end):
+        '''XY waypoints (end included) for a level move that keeps clear of the
+        base axis. Direct when the straight line is far enough from the base,
+        otherwise an arc of radius R_ARC passing behind the base (x < 0).'''
+
+        sx, sy = start
+        ex, ey = end
+
+        if math.hypot(sx, sy) < R_CLEAR or math.hypot(ex, ey) < R_CLEAR:
+            return [end]
+
+        dx, dy = ex - sx, ey - sy
+        length2 = dx * dx + dy * dy
+        if length2 < 1e-9:
+            return [end]
+
+        t = max(0.0, min(1.0, -(sx * dx + sy * dy) / length2))
+        if math.hypot(sx + t * dx, sy + t * dy) >= R_CLEAR:
+            return [end]
+
+        theta_s = math.atan2(sy, sx)
+        theta_e = math.atan2(ey, ex)
+        inc = (theta_e - theta_s) % (2.0 * math.pi)
+        dec = inc - 2.0 * math.pi
+
+        delta = inc if math.cos(theta_s + inc / 2.0) < 0.0 else dec
+
+        n = max(1, int(math.ceil(abs(delta) / math.radians(ARC_STEP_DEG))))
+        points = []
+        for k in range(1, n):
+            angle = theta_s + delta * k / n
+            points.append((R_ARC * math.cos(angle), R_ARC * math.sin(angle)))
+        points.append(end)
+
+        return points
+
+    def start_path(self, end3):
+        points = self.plan_path_xy(
+            (self.tcp_pose.position.x, self.tcp_pose.position.y),
+            (end3[0], end3[1])
+        )
+        self.path = [(x, y, end3[2]) for x, y in points]
+        self.path_idx = 0
+
+        if len(self.path) > 1:
+            self.get_logger().info(
+                f'Routing around the base with {len(self.path) - 1} arc point(s).'
+            )
+
+    def follow_path(self, kp, speed, tol_final):
+        '''Follow self.path. True when the last point is reached (or timed out).'''
+
+        if self.path is None:
+            return True
+
+        target = self.path[self.path_idx]
+        last = self.path_idx == len(self.path) - 1
+
+        distance = self.publish_slow_twist_to(
+            target, kp, speed, hold_speed=not last
+        )
+
+        if distance < (tol_final if last else TOL_ARC):
+            if last:
+                self.stop_twist()
+                self.path = None
+                return True
+            self.path_idx += 1
+            return False
+
+        if self.phase_elapsed() > 2.0 * MOVE_TIMEOUT_S:
+            self.get_logger().warn(
+                f'Path timeout in phase {self.phase}; continuing.'
+            )
+            self.stop_twist()
+            self.path = None
+            return True
+
+        return False
+
+    def force_steady_in_band(self):
+        '''True when recent force readings sit steadily in the held-ore band.'''
+
+        now = self.now_seconds()
+        samples = [f for t, f in self.force_hist if now - t <= FORCE_STABLE_WINDOW_S]
+
+        if len(samples) < 2:
+            return False
+
+        return (
+            min(samples) >= FORCE_HELD_MIN_N
+            and max(samples) <= FORCE_HELD_MAX_N
+            and max(samples) - min(samples) <= FORCE_STABLE_RANGE_N
+        )
 
     # ------------------------- CONTROLLER SWITCHING -------------------------
 
-    def switch_controller(self, controller):
+    def switch_controller(self, controller, strict=True):
+        if self.active_controller == controller:
+            self.on_switch_done(controller)
+            return True
+
         req = SwitchController.Request()
         req.activate_controllers = [controller]
-
-        other_controller = (
-            joint_controller
-            if controller == twist_controller
-            else twist_controller
+        req.deactivate_controllers = [
+            joint_controller if controller == twist_controller else twist_controller
+        ]
+        req.strictness = (
+            SwitchController.Request.STRICT
+            if strict else SwitchController.Request.BEST_EFFORT
         )
 
-        req.deactivate_controllers = [other_controller]
-        req.strictness = SwitchController.Request.STRICT
-
-        if not self.switch_cli.wait_for_service(timeout_sec=20.0):
-            self.get_logger().error(
-                'Controller switch service not available.'
-            )
+        if not self.switch_cli.wait_for_service(timeout_sec=10.0):
+            self.get_logger().error('Controller switch service not available.')
             return False
 
         self.switch_future = self.switch_cli.call_async(req)
         self.switch_target = controller
+        self.motion_state = 'WAIT_SWITCH'
         return True
+
+    def on_switch_done(self, target):
+        self.active_controller = target
+        self.switch_retries = 0
+        self.get_logger().info(f'Switched to {target}')
+
+        if target == joint_controller:
+            self.motion_state = 'RECOVERY' if self.in_recovery else 'UNFOLDING'
+            return
+
+        # Twist controller is active.
+        if self.in_recovery:
+            self.in_recovery = False
+
+            if not self.unfolded:
+                self.switch_controller(joint_controller)
+                return
+
+            self.motion_state = 'RUN'
+            if self.tcp_pose is not None:
+                self.recover_target = (
+                    self.tcp_pose.position.x,
+                    self.tcp_pose.position.y,
+                    max(self.tcp_pose.position.z + 0.08, TRAVEL_Z),
+                )
+            self.set_phase('RECOVER_UP')
+            return
+
+        if not self.unfolded:
+            self.unfolded = True
+            self.motion_state = 'RUN'
+            self.set_phase('LEVEL')
+            return
+
+        self.motion_state = 'RUN'
 
     # ------------------------- UNFOLD / RECOVERY -------------------------
 
@@ -371,17 +573,12 @@ class arm_task2a(Node):
         velocities = []
         max_error = 0.0
 
-        for joint in joint_names:
-            idx = joint_names.index(joint)
-            current = self.joint_angles[idx]
-            target = unfold_target[joint]
-
-            error = target - current
+        for idx, joint in enumerate(joint_names):
+            error = unfold_target[joint] - self.joint_angles[idx]
             max_error = max(max_error, abs(error))
 
-            velocity = unfold_kp * error
             velocity = max(
-                min(velocity, cap_joint_rps * 0.9),
+                min(unfold_kp * error, cap_joint_rps * 0.9),
                 -cap_joint_rps * 0.9
             )
             velocities.append(velocity)
@@ -410,459 +607,558 @@ class arm_task2a(Node):
         velocities = [0.0] * len(joint_names)
         velocities[idx] = 0.05
         msg.velocities = velocities
-
         self.joint_pub.publish(msg)
 
         return current > -2.80
+
+    def handle_recovery(self):
+        self.stop_twist()
+
+        if self.unlock_future is None:
+            if self.unlock_client.service_is_ready():
+                self.unlock_future = self.unlock_client.call_async(Trigger.Request())
+                self.get_logger().warn('Protective stop detected; unlock requested.')
+            return
+
+        if not self.unlock_future.done():
+            return
+
+        try:
+            response = self.unlock_future.result()
+        except Exception:
+            response = None
+
+        self.unlock_future = None
+
+        if response is None or not response.success:
+            self.get_logger().error('Protective stop unlock failed; retrying.')
+            return
+
+        self.recovery_required = False
+        self.in_recovery = True
+        self.path = None
+        self.get_logger().warn('Protective stop unlocked; starting recovery.')
+
+        # Release anything held, and avoid repeating a pick that keeps stopping.
+        self.request_magnet(False, 'recovery')
+
+        ore = self.current_ore
+        if ore is not None and ore not in self.done_ores:
+            self.stop_counts[ore] = self.stop_counts.get(ore, 0) + 1
+            if self.stop_counts[ore] >= MAX_STOPS_PER_ORE:
+                self.get_logger().warn(f'Skipping {ore} after repeated stops.')
+                self.skipped_ores.add(ore)
+
+        self.switch_controller(joint_controller)
 
     # ------------------------- TF / ORE -------------------------
 
     def lookup_ore(self, ore_id):
         try:
             transform = self.tf_buffer.lookup_transform(
-                base_frame,
-                ore_id,
-                rclpy.time.Time()
+                base_frame, ore_id, rclpy.time.Time()
             )
-
             t = transform.transform.translation
             return (float(t.x), float(t.y), float(t.z))
-
         except Exception:
             return None
 
+    def discover_ores(self):
+        try:
+            text = self.tf_buffer.all_frames_as_string()
+        except Exception:
+            return []
+
+        names = set(re.findall(r'Frame (\S+) exists with parent', text))
+        return sorted(n for n in names if ORE_RE.match(n))
+
     def select_next_ore(self):
-        while self.ore_index < len(ORE_ORDER):
-            ore_id = ORE_ORDER[self.ore_index]
-            position = self.lookup_ore(ore_id)
+        found = self.discover_ores()
+        remaining = [
+            o for o in found
+            if o not in self.done_ores and o not in self.skipped_ores
+        ]
 
-            if position is None:
+        if not remaining:
+            if self.skipped_ores and self.retry_rounds < MAX_RETRY_ROUNDS:
+                self.retry_rounds += 1
+                self.get_logger().warn(
+                    f'Trying the skipped ores again: {sorted(self.skipped_ores)}'
+                )
+                for ore in self.skipped_ores:
+                    self.pick_attempts[ore] = 0
+                    self.stop_counts[ore] = 0
+                self.skipped_ores.clear()
+                return
+
+            handled = len(self.done_ores) + len(self.skipped_ores)
+
+            if self.idle_start is None:
+                self.idle_start = self.now_seconds()
+
+            idle = self.now_seconds() - self.idle_start
+
+            if handled >= EXPECTED_ORES or idle > IDLE_WAIT_S:
+                self.stop_twist()
                 self.get_logger().info(
-                    f'Waiting for TF: {ore_id}'
+                    f'Task 2A complete: dropped={sorted(self.done_ores)}, '
+                    f'skipped={sorted(self.skipped_ores)}'
                 )
-                return False
-
-            if ore_id.startswith('azurite_ore'):
-                ore_type = 'azurite_ore'
-            elif ore_id.startswith('malachite_ore'):
-                ore_type = 'malachite_ore'
-            elif ore_id.startswith('vanadinite_ore'):
-                ore_type = 'vanadinite_ore'
+                self.motion_state = 'DONE'
             else:
-                ore_type = None
-
-            if ore_type not in DROP_POINTS:
-                self.get_logger().error(
-                    f'No drop point for {ore_id}'
+                self.get_logger().info(
+                    'Waiting for remaining ore TFs...', throttle_duration_sec=2.0
                 )
-                self.motion_state = 'ERROR'
-                return False
+            return
 
-            self.current_ore = ore_id
-            self.current_ore_position = position
-            self.current_drop_position = DROP_POINTS[ore_type]
-            self.transport_waypoint = TRANSPORT_WAYPOINT
-            self.transport_phase = None
+        self.idle_start = None
 
-            self.get_logger().info(
-                f'Picked target {ore_id}: '
-                f'x={position[0]:.3f}, '
-                f'y={position[1]:.3f}, '
-                f'z={position[2]:.3f}'
+        # Nearest remaining ore (in the horizontal plane) first.
+        best = None
+        best_dist = float('inf')
+
+        for ore_id in remaining:
+            position = self.lookup_ore(ore_id)
+            if position is None:
+                continue
+
+            dist = math.hypot(
+                position[0] - self.tcp_pose.position.x,
+                position[1] - self.tcp_pose.position.y,
             )
+            if dist < best_dist:
+                best = (ore_id, position)
+                best_dist = dist
 
-            self.set_phase('APPROACH')
-            self.motion_state = 'PICK'
-            return True
+        if best is None:
+            return
 
-        self.stop_twist()
+        ore_id, position = best
+        ore_type = ore_id.rsplit('_', 1)[0]
+
+        self.current_ore = ore_id
+        self.current_ore_position = position
+        self.current_drop_position = DROP_POINTS[ore_type]
+        self.pick_attempt = self.pick_attempts.get(ore_id, 0)
+
         self.get_logger().info(
-            'Task 2A complete: all ores processed.'
+            f'Target {ore_id}: x={position[0]:.3f}, '
+            f'y={position[1]:.3f}, z={position[2]:.3f}'
         )
-        self.motion_state = 'DONE'
-        return False
+        self.start_path(self.ore_hover_target())
+        self.set_phase('HOVER')
+
+    def ore_hover_target(self):
+        x, y, z = self.current_ore_position
+        return (x, y, max(TRAVEL_Z, z + HOVER_HEIGHT))
+
+    def search_offset(self):
+        return SEARCH_OFFSETS[self.pick_attempt % len(SEARCH_OFFSETS)]
 
     def ore_approach_target(self):
         x, y, z = self.current_ore_position
-        return (x, y, z + APPROACH_HEIGHT)
+        ox, oy = self.search_offset()
+        return (x + ox, y + oy, z + APPROACH_HEIGHT)
 
     def ore_pick_target(self):
         x, y, z = self.current_ore_position
-        return (x, y, z + PICK_OFFSET_Z)
+        ox, oy = self.search_offset()
+        extra = PICK_Z_TRIES[self.pick_attempt % len(PICK_Z_TRIES)]
+        return (x + ox, y + oy, z + PICK_OFFSET_Z + extra)
+
+    def pick_failed(self):
+        ore = self.current_ore
+        self.pick_attempts[ore] = self.pick_attempts.get(ore, 0) + 1
+        self.pick_attempt = self.pick_attempts[ore]
+
+        self.set_phase('RELEASE_WAIT')
+
+        if self.pick_attempt >= MAX_PICK_ATTEMPTS:
+            self.get_logger().warn(
+                f'{ore}: {self.pick_attempt} failed picks; leaving it for a later round.'
+            )
+            self.skipped_ores.add(ore)
+            self.request_magnet(False, 'skip')
+        else:
+            self.get_logger().warn(
+                f'Pick not confirmed for {ore}; re-checking its position and '
+                f'trying again (attempt {self.pick_attempt + 1}).'
+            )
+            self.request_magnet(False, 'retry')
 
     def ore_lift_target(self):
         x, y, z = self.current_ore_position
-        return (x, y, z + LIFT_HEIGHT)
+        return (x, y, max(TRAVEL_Z, z + LIFT_HEIGHT))
+
+    def drop_travel_target(self):
+        dx, dy, dz = self.current_drop_position
+        return (dx, dy, max(TRAVEL_Z, dz + DROP_APPROACH_HEIGHT))
+
+    def drop_approach_target(self):
+        dx, dy, dz = self.current_drop_position
+        return (dx, dy, dz + DROP_APPROACH_HEIGHT)
 
     # ------------------------- MAGNET -------------------------
 
-    def request_magnet(self, enabled):
-        if self.magnet_future is not None:
+    def request_magnet(self, enabled, reason):
+        '''Queue a magnet command; it is sent as soon as the service is ready.'''
+        self.magnet_request = (enabled, reason)
+
+    def pump_magnet(self):
+        if self.magnet_future is not None or self.magnet_request is None:
             return
 
-        if not self.magnet_client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().error(
-                'Magnet service /magnet is not available.'
+        if not self.magnet_client.service_is_ready():
+            self.get_logger().warn(
+                'Waiting for /magnet service...', throttle_duration_sec=2.0
             )
-            self.motion_state = 'ERROR'
             return
+
+        enabled, reason = self.magnet_request
+        self.magnet_request = None
 
         request = SetBool.Request()
         request.data = enabled
 
         self.magnet_target = enabled
-        self.magnet_future = self.magnet_client.call_async(
-            request
-        )
+        self.magnet_reason = reason
+        self.magnet_future = self.magnet_client.call_async(request)
 
-    def process_magnet_future(self):
-        if self.magnet_future is None:
-            return False
-
+    def check_magnet_future(self):
         if not self.magnet_future.done():
-            return True
+            return
 
         try:
             response = self.magnet_future.result()
-        except Exception as error:
-            self.get_logger().error(
-                f'Magnet service failed: {error}'
+            message = '' if response is None else response.message
+            self.get_logger().info(
+                f'Magnet {"ON" if self.magnet_target else "OFF"}: {message}'
             )
-            self.motion_state = 'ERROR'
-            self.magnet_future = None
-            return True
+        except Exception as error:
+            self.get_logger().error(f'Magnet service call failed: {error}')
 
         self.magnet_future = None
+        reason = self.magnet_reason
 
-        if response is None or not response.success:
-            message = (
-                'no response'
-                if response is None
-                else response.message
+        if reason == 'pick':
+            self.set_phase('VERIFY')
+        elif reason in ('retry', 'skip'):
+            self.retry_target = (
+                self.tcp_pose.position.x,
+                self.tcp_pose.position.y,
+                max(TRAVEL_Z, self.tcp_pose.position.z),
             )
-            self.get_logger().error(
-                f'Magnet command failed: {message}'
-            )
-            self.motion_state = 'ERROR'
-            return True
-
-        self.get_logger().info(
-            f'Magnet {"ON" if self.magnet_target else "OFF"}: '
-            f'{response.message}'
-        )
-
-        if self.magnet_target:
-            self.magnet_on_time = self.now_seconds()
-            self.force_wait_start = self.now_seconds()
-            self.set_phase('VERIFY_PICK')
-        else:
+            self.rescan_done = False
+            self.rescan_last = -100.0
+            self.set_phase('RETRY_LIFT' if reason == 'retry' else 'SKIP_LIFT')
+        elif reason == 'drop':
             self.set_phase('DROP_SETTLE')
 
-        return True
-
-    # ------------------------- MAIN TASK STATE MACHINE -------------------------
+    # ------------------------- MAIN LOOP -------------------------
 
     def process(self):
-        # Never continue motion blindly during a protective stop.
+        self.pump_magnet()
+
         if self.recovery_required:
-            self.stop_twist()
-
-            if self.unlock_future is None:
-                if self.unlock_client.service_is_ready():
-                    self.unlock_future = (
-                        self.unlock_client.call_async(
-                            Trigger.Request()
-                        )
-                    )
-                    self.get_logger().warn(
-                        'Protective stop detected; unlock requested.'
-                    )
-                return
-
-            if not self.unlock_future.done():
-                return
-
-            try:
-                response = self.unlock_future.result()
-            except Exception:
-                response = None
-
-            self.unlock_future = None
-
-            if response is not None and response.success:
-                self.recovery_required = False
-                self.in_recovery = True
-                self.recovery_state = 'SWITCH_TO_JOINT'
-                self.switch_controller(joint_controller)
-                self.motion_state = 'WAIT_SWITCH'
-                self.get_logger().warn(
-                    'Protective stop unlocked; starting recovery.'
-                )
-            else:
-                self.get_logger().error(
-                    'Protective stop unlock failed.'
-                )
+            self.handle_recovery()
             return
 
-        # A controller switch is asynchronous.
         if self.switch_future is not None:
             if not self.switch_future.done():
                 return
 
             response = self.switch_future.result()
             target = self.switch_target
-
             self.switch_future = None
             self.switch_target = None
 
             if response is None or not response.ok:
-                message = (
-                    'no response'
-                    if response is None
-                    else response.message
-                )
+                self.switch_retries += 1
                 self.get_logger().error(
-                    f'Controller switch failed: {message}'
+                    f'Controller switch to {target} failed '
+                    f'(attempt {self.switch_retries}).'
                 )
-                self.motion_state = 'ERROR'
+                if self.switch_retries > 5:
+                    self.motion_state = 'ERROR'
+                else:
+                    self.switch_controller(target, strict=False)
                 return
 
-            self.get_logger().info(
-                f'Switched to {target}'
-            )
-
-            if target == joint_controller:
-                if self.recovery_state == 'SWITCH_TO_JOINT':
-                    self.motion_state = 'RECOVERY'
-                else:
-                    self.motion_state = 'UNFOLDING'
-            else:
-                if self.in_recovery:
-                    self.in_recovery = False
-                    self.recovery_state = 'NONE'
-                    self.motion_state = 'READY'
-                elif self.motion_state == 'UNFOLDING':
-                    self.motion_state = 'READY'
-                else:
-                    self.motion_state = 'READY'
-
+            self.on_switch_done(target)
             return
 
-        # Magnet service result is also asynchronous.
         if self.magnet_future is not None:
-            self.process_magnet_future()
+            self.check_magnet_future()
             return
 
-        # Wait for all mandatory feedback.
-        if self.tcp_pose is None:
+        if self.magnet_request is not None:
+            self.stop_twist()
             return
 
-        if self.joint_angles is None:
+        if self.tcp_pose is None or self.joint_angles is None or self.arm_status is None:
             return
 
-        if self.arm_status is None:
+        state = self.motion_state
+
+        if state == 'INIT':
+            self.start_time = self.now_seconds()
+            self.get_logger().info('Waiting for ore transforms from perception.')
+            self.motion_state = 'WAIT_ORES'
             return
 
-        # ------------------------- INIT -------------------------
+        if state == 'WAIT_ORES':
+            found = self.discover_ores()
+            elapsed = self.now_seconds() - self.start_time
 
-        if self.motion_state == 'INIT':
-            self.get_logger().info(
-                'Starting Task 2A: switching to joint controller.'
-            )
-            if self.switch_controller(joint_controller):
-                self.motion_state = 'WAIT_SWITCH'
-            return
-
-        # ------------------------- UNFOLD -------------------------
-
-        if self.motion_state == 'UNFOLDING':
-            if self.unfold_arm():
+            if len(found) >= EXPECTED_ORES or (found and elapsed > WAIT_ORES_TIMEOUT_S):
                 self.get_logger().info(
-                    'Arm unfolded; switching to twist controller.'
+                    f'Ore transforms available: {found}. Unfolding arm.'
                 )
+                if not self.switch_controller(joint_controller):
+                    self.motion_state = 'WAIT_ORES'
+            else:
+                self.get_logger().info(
+                    f'Found {len(found)} ore frame(s)...', throttle_duration_sec=2.0
+                )
+            return
+
+        if state == 'UNFOLDING':
+            if self.unfold_arm():
+                self.get_logger().info('Arm unfolded; switching to twist controller.')
                 self.switch_controller(twist_controller)
             return
 
-        # ------------------------- RECOVERY -------------------------
-
-        if self.motion_state == 'RECOVERY':
-            if self.recover_arm():
-                if self.arm_status == 0:
-                    self.in_recovery = False
-                    self.recovery_state = 'NONE'
-                    self.switch_controller(twist_controller)
+        if state == 'RECOVERY':
+            if self.recover_arm() and self.arm_status == 0:
+                self.switch_controller(twist_controller)
             return
 
-        # ------------------------- READY -------------------------
+        if state == 'RUN':
+            self.run_phase()
+            return
 
-        if self.motion_state == 'READY':
-            if self.ore_index >= len(ORE_ORDER):
-                self.motion_state = 'DONE'
+        if state in ('DONE', 'ERROR'):
+            self.stop_twist()
+            return
+
+    # ------------------------- PER-ORE PHASES -------------------------
+
+    def run_phase(self):
+        p = self.phase
+
+        if p == 'LEVEL':
+            # Turn the tool until it points straight down.
+            if self.tool_axis is None:
+                self.choose_tool_axis()
+                self.level_tilt0 = self.tool_tilt()
+                self.level_checked = False
+                self.get_logger().info(
+                    f'Tool axis {self.tool_axis}; tilt from vertical = '
+                    f'{math.degrees(self.level_tilt0):.1f} deg.'
+                )
+
+            tilt = self.tool_tilt()
+            elapsed = self.phase_elapsed()
+
+            # If the tilt grows, the rotation sign is the wrong way round.
+            if not self.level_checked and elapsed > 1.5:
+                self.level_checked = True
+                if tilt > self.level_tilt0 + 0.02:
+                    self.ang_sign = -self.ang_sign
+                    self.get_logger().warn('Tilt grew; reversing the rotation sign.')
+
+            if tilt < LEVEL_TOL_RAD or elapsed > LEVEL_TIMEOUT_S:
+                self.stop_twist()
+                self.get_logger().info(
+                    f'Tool levelled: tilt {math.degrees(tilt):.2f} deg.'
+                )
+                self.set_phase('SELECT')
                 return
 
-            self.motion_state = 'FIND_ORE'
+            msg = TwistStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = base_frame
+            wx, wy, wz = self.orientation_rate()
+            msg.twist.angular.x = wx
+            msg.twist.angular.y = wy
+            msg.twist.angular.z = wz
+            self.twist_pub.publish(msg)
             return
 
-        # ------------------------- FIND ORE -------------------------
-
-        if self.motion_state == 'FIND_ORE':
+        if p == 'SELECT':
             self.select_next_ore()
             return
 
-        # ------------------------- PICK -------------------------
+        # ---- Pick ----
 
-        if self.motion_state == 'PICK':
-            if self.phase == 'APPROACH':
-                distance = self.publish_twist_to(
-                    self.ore_approach_target()
-                )
+        if p == 'HOVER':
+            if self.follow_path(TRAVEL_KP, TRAVEL_SPEED, TOL_COARSE):
+                self.set_phase('APPROACH')
+            return
 
-                if distance < position_tolerance:
-                    self.stop_twist()
-                    self.set_phase('DESCEND')
+        if p == 'APPROACH':
+            if self.go(self.ore_approach_target(), APPROACH_KP, APPROACH_SPEED, TOL_FINE):
+                self.set_phase('DESCEND')
+            return
 
-                return
-
-            if self.phase == 'DESCEND':
-                distance = self.publish_twist_to(
-                    self.ore_pick_target()
-                )
-
-                if distance < position_tolerance:
-                    self.stop_twist()
-
-                    self.force_baseline = self.force_magnitude
-                    self.request_magnet(True)
-
-                return
-
-            if self.phase == 'VERIFY_PICK':
-                self.stop_twist()
-
-                force = self.force_magnitude
-                baseline = (
-                    0.0
-                    if self.force_baseline is None
-                    else self.force_baseline
-                )
-
-                if force is not None and (
-                    force >= FORCE_THRESHOLD_N or
-                    force >= baseline + FORCE_THRESHOLD_N
-                ):
-                    self.get_logger().info(
-                        f'Pick confirmed for {self.current_ore}; '
-                        f'force={force:.3f} N'
-                    )
-                    self.set_phase('LIFT')
-                    return
-
-                if self.phase_elapsed() > FORCE_WAIT_S:
-                    self.get_logger().error(
-                        f'Pick verification failed for '
-                        f'{self.current_ore}; '
-                        f'force={force}'
-                    )
-                    self.request_magnet(False)
-                    self.motion_state = 'ERROR'
-
-                return
-
-            if self.phase == 'LIFT':
-                distance = self.publish_twist_to(
-                    self.ore_lift_target()
-                )
-
-                if distance < position_tolerance:
-                    self.stop_twist()
-                    self.transport_phase = 'WAYPOINT_2'
-                    self.set_phase('TRANSPORT_WAYPOINT')
-
-                return
-
-        # ------------------------- SAFE TRANSPORT PATH -------------------------
-
-        if self.motion_state == 'PICK' and self.phase == 'TRANSPORT_WAYPOINT':
-            # Keep the ore attached and route through the requested waypoint #2.
-            distance = self.publish_slow_twist_to(
-                self.transport_waypoint,
-                kp=TRANSPORT_KP,
-                max_speed=TRANSPORT_MAX_SPEED
+        if p == 'DESCEND':
+            force = self.force_magnitude
+            contact = (
+                force is not None
+                and force > CONTACT_FORCE_N
+                and self.phase_elapsed() > 0.5
             )
 
-            if distance < position_tolerance:
+            if contact:
+                # Touched something before reaching the target height. Back off
+                # a few mm, then switch the magnet on from there.
                 self.stop_twist()
+                self.backoff_target = (
+                    self.tcp_pose.position.x,
+                    self.tcp_pose.position.y,
+                    self.tcp_pose.position.z + CONTACT_BACKOFF_M,
+                )
                 self.get_logger().info(
-                    f'Reached transport waypoint #2: {self.transport_waypoint}'
+                    f'Contact at {force:.1f} N; backing off before the magnet.'
                 )
-                self.transport_phase = 'ABOVE_DROP'
+                self.set_phase('BACKOFF')
+                return
+
+            if self.go(
+                self.ore_pick_target(), DESCEND_KP, DESCEND_SPEED,
+                position_tolerance
+            ):
+                self.set_phase('MAGNET_ON')
+                self.request_magnet(True, 'pick')
+            return
+
+        if p == 'BACKOFF':
+            if self.go(self.backoff_target, 1.5, 0.03, 0.003):
+                self.set_phase('MAGNET_ON')
+                self.request_magnet(True, 'pick')
+            return
+
+        if p in ('MAGNET_ON', 'RELEASE_WAIT'):
+            self.stop_twist()
+            return
+
+        if p == 'VERIFY':
+            self.stop_twist()
+
+            force = self.force_magnitude
+            elapsed = self.phase_elapsed()
+
+            self.get_logger().info(
+                f'Verifying pick: force={force}',
+                throttle_duration_sec=0.5
+            )
+
+            if elapsed >= MAGNET_SETTLE_S and self.force_steady_in_band():
+                self.get_logger().info(
+                    f'Pick confirmed for {self.current_ore}; force={force:.3f} N'
+                )
+                self.set_phase('LIFT')
+                return
+
+            # Pressing on something hard, or nothing held: the ore is not on the
+            # magnet. Never carry on without a confirmed pick.
+            blocked = (
+                force is not None
+                and force > 2.0 * CONTACT_FORCE_N
+                and elapsed > 0.6
+            )
+            if blocked or elapsed > FORCE_WAIT_S:
+                self.pick_failed()
+            return
+
+        if p == 'RETRY_LIFT':
+            if self.go(self.retry_target, APPROACH_KP, APPROACH_SPEED, TOL_FINE):
+                self.set_phase('RESCAN')
+            return
+
+        if p == 'RESCAN':
+            # Ask perception for a fresh detection of this ore (it may have been
+            # nudged), then use the new transform for the next attempt.
+            self.stop_twist()
+            elapsed = self.phase_elapsed()
+
+            if elapsed - self.rescan_last > 2.0 and not self.rescan_done:
+                self.rescan_last = elapsed
+                msg = String()
+                msg.data = self.current_ore
+                self.rescan_pub.publish(msg)
+
+            if self.rescan_done or elapsed > RESCAN_TIMEOUT_S:
+                position = self.lookup_ore(self.current_ore)
+                if position is not None:
+                    old = self.current_ore_position
+                    self.current_ore_position = position
+                    self.get_logger().info(
+                        f'{self.current_ore} position now '
+                        f'({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}), '
+                        f'shift {1000.0 * math.dist(old, position):.0f} mm.'
+                    )
+                self.start_path(self.ore_hover_target())
+                self.set_phase('HOVER')
+            return
+
+        if p == 'SKIP_LIFT':
+            if self.go(self.retry_target, APPROACH_KP, APPROACH_SPEED, TOL_FINE):
+                self.set_phase('SELECT')
+            return
+
+        if p == 'LIFT':
+            if self.go(self.ore_lift_target(), LIFT_KP, LIFT_SPEED, TOL_FINE):
+                self.start_path(self.drop_travel_target())
+                self.set_phase('TRANSIT')
+            return
+
+        # ---- Transport and drop ----
+
+        if p == 'TRANSIT':
+            if self.follow_path(TRANSPORT_KP, TRANSPORT_MAX_SPEED, TOL_COARSE):
                 self.set_phase('DROP_APPROACH')
-
             return
 
-        # Move above the container first, then descend vertically. This avoids
-        # taking a long diagonal directly into the container area.
-        if self.motion_state == 'PICK' and self.phase == 'DROP_APPROACH':
-            dx, dy, dz = self.current_drop_position
-            target = (dx, dy, dz + DROP_APPROACH_HEIGHT)
-
-            distance = self.publish_slow_twist_to(
-                target,
-                kp=DROP_KP,
-                max_speed=DROP_MAX_SPEED
-            )
-
-            if distance < position_tolerance:
-                self.stop_twist()
+        if p == 'DROP_APPROACH':
+            if self.go(self.drop_approach_target(), DROP_KP, DROP_MAX_SPEED, TOL_FINE):
                 self.set_phase('DROP_DESCEND')
-
             return
 
-        if self.motion_state == 'PICK' and self.phase == 'DROP_DESCEND':
-            distance = self.publish_slow_twist_to(
-                self.current_drop_position,
-                kp=DROP_KP,
-                max_speed=DROP_MAX_SPEED
-            )
-
-            if distance < position_tolerance:
-                self.stop_twist()
-                self.request_magnet(False)
-
+        if p == 'DROP_DESCEND':
+            if self.go(self.current_drop_position, DROP_KP, DROP_DESCEND_SPEED, position_tolerance):
+                self.set_phase('DROP_RELEASE')
+                self.request_magnet(False, 'drop')
             return
 
-        # ------------------------- DROP SETTLE -------------------------
+        if p == 'DROP_RELEASE':
+            self.stop_twist()
+            return
 
-        if self.motion_state == 'PICK' and self.phase == 'DROP_SETTLE':
+        if p == 'DROP_SETTLE':
             self.stop_twist()
 
             if self.phase_elapsed() >= DROP_SETTLE_S:
+                self.done_ores.add(self.current_ore)
                 self.get_logger().info(
                     f'Dropped {self.current_ore} into '
-                    f'{self.current_ore.rsplit("_", 2)[0]} container.'
+                    f'{self.current_ore.rsplit("_", 1)[0]} container.'
                 )
-
-                self.ore_index += 1
-                self.current_ore = None
-                self.current_ore_position = None
-                self.current_drop_position = None
-                self.transport_waypoint = TRANSPORT_WAYPOINT
-                self.transport_phase = None
-
-                self.motion_state = 'FIND_ORE'
-
+                self.set_phase('DROP_RETREAT')
             return
 
-        # ------------------------- DONE -------------------------
+        # ---- Leave the container area ----
 
-        if self.motion_state == 'DONE':
-            self.stop_twist()
+        if p == 'DROP_RETREAT':
+            if self.go(self.drop_travel_target(), DROP_KP, DROP_MAX_SPEED, TOL_COARSE):
+                self.set_phase('SELECT')
             return
 
-        # ------------------------- ERROR -------------------------
-
-        if self.motion_state == 'ERROR':
-            self.stop_twist()
+        if p == 'RECOVER_UP':
+            if self.recover_target is None or self.go(
+                self.recover_target, APPROACH_KP, 0.05, TOL_FINE
+            ):
+                self.set_phase('LEVEL')
             return
 
 
@@ -870,10 +1166,16 @@ def main(args=None):
     rclpy.init(args=args)
 
     node = arm_task2a()
-    rclpy.spin(node)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
 
     node.destroy_node()
-    rclpy.shutdown()
+
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

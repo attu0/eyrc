@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 '''
 *****************************************************************************************
 *
@@ -8,7 +7,7 @@
 *                       StrataCobot (SC) Theme (eYRC 2026-27)
 *            ===============================================
 *
-*  This script should be used to implement Task 2A perception of StrataCobot (SC) Theme (eYRC 2026-27).
+*  This script implements Task 2A perception of StrataCobot (SC) Theme (eYRC 2026-27).
 *
 *  This software is made available on an "AS IS WHERE IS BASIS".
 *  Licensee/end user indemnifies and will keep e-Yantra indemnified from
@@ -21,10 +20,10 @@
 # Team ID:          [ 1449 ]
 # Author List:      [ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
 # Filename:         task2A_perception.py
-# Functions:        detect_ores, __init__, depthimagecb, colorimagecb,
-#                   caminfocb, process_image, main
-# Global variables: ore_types, color_topic, depth_topic,
-#                   camera_info_topic, base_frame
+# Functions:        detect_ores, quat_to_matrix, __init__, depthimagecb, colorimagecb,
+#                   caminfocb, sample_depth, pixel_to_base, match_track,
+#                   publish_locked, process_image, main
+# Global variables: ore_types, color_topic, depth_topic, camera_info_topic, base_frame
 # Nodes:             Publishing Topics  - [ /tf ]
 #                    Subscribing Topics - [ /camera/camera/color/image_raw,
 #                                           /camera/camera/aligned_depth_to_color/image_raw,
@@ -33,40 +32,57 @@
 
 ################### IMPORT MODULES #######################
 
-import rclpy
 import sys
-import cv2
-import tf2_ros
-import numpy as np
 
-from rclpy.node import Node
+import cv2
+import numpy as np
+import rclpy
+import tf2_ros
+
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import PointStamped, TransformStamped
+from geometry_msgs.msg import TransformStamped
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
-from tf2_geometry_msgs import do_transform_point
+from std_msgs.msg import String
 
 
 ##################### TASK CONSTANTS #######################
 
-# Task 2A uses four ores. Each type may use IDs 1 and 2.
-# Ore transforms are published as <type>_ore_1 / <type>_ore_2.
 ore_types = [
     'azurite_ore',
     'malachite_ore',
     'vanadinite_ore'
 ]
 
-# RealSense colour image topic.
 color_topic = '/camera/camera/color/image_raw'
-
-# RealSense depth image aligned with the colour image.
 depth_topic = '/camera/camera/aligned_depth_to_color/image_raw'
-
-# RealSense camera information topic.
 camera_info_topic = '/camera/camera/color/camera_info'
 
-# Parent frame for every ore transform.
 base_frame = 'base_link'
+cam_frame_id = 'camera_color_optical_frame'
+
+# Total ores on the conveyor in Task 2A.
+EXPECTED_ORES = 4
+
+# Number of consistent detections needed before an ore position is locked.
+N_SAMPLES = 8
+
+# Detections of one ore must stay inside this pixel radius to count as the same ore.
+TRACK_RADIUS_PX = 20
+
+# Contour area limits (pixels) for something to be an ore.
+MIN_AREA = 150
+MAX_AREA = 8000
+
+# Container positions (x, y) in base_link. Anything detected near them is a
+# container outline or an ore that was already dropped, never an ore to pick.
+CONTAINER_POINTS = [(-0.07, 0.55), (-0.40, 0.55), (-0.65, 0.55)]
+CONTAINER_EXCLUDE_RADIUS = 0.15
+
+# Seconds the node spends re-detecting one ore when the arm asks for it.
+RESCAN_TIMEOUT_S = 5.0
 
 
 ##################### FUNCTION DEFINITIONS #######################
@@ -74,29 +90,22 @@ base_frame = 'base_link'
 def detect_ores(image):
     '''
     Description:
-        Detects ores present in a colour image and returns the center
-        pixel location and type of each detected ore.
+        Detects ores in a colour image and returns the centre pixel and
+        type of each detected ore.
 
     Args:
-        image (numpy.ndarray):
-            Input colour image frame received from the camera topic.
+        image (numpy.ndarray): BGR colour image.
 
     Returns:
-        center_ore_list (list):
-            Center pixel coordinates (cX, cY) of every detected ore.
-
-        ore_type_list (list):
-            Type of each detected ore.
+        center_ore_list (list): (cX, cY) of every detected ore.
+        ore_type_list (list): type of each detected ore.
     '''
-
-    ############ Function VARIABLES ############
 
     center_ore_list = []
     ore_type_list = []
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # HSV colour ranges for the three ore types.
     color_bounds = {
         'azurite_ore': ((95, 150, 100), (115, 255, 255)),
         'malachite_ore': ((60, 150, 100), (90, 255, 255)),
@@ -105,41 +114,21 @@ def detect_ores(image):
 
     for ore_type, (lower, upper) in color_bounds.items():
 
-        mask = cv2.inRange(
-            hsv,
-            np.array(lower),
-            np.array(upper)
-        )
-
-        # Remove small noise from the binary mask.
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_OPEN,
-            np.ones((5, 5), np.uint8)
-        )
-
-        # Fill small gaps inside detected regions.
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_CLOSE,
-            np.ones((5, 5), np.uint8)
-        )
+        mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
         contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         for contour in contours:
 
-            # Ignore regions that are too small to be ores.
-            if cv2.contourArea(contour) < 150:
+            area = cv2.contourArea(contour)
+            if area < MIN_AREA or area > MAX_AREA:
                 continue
 
             moments = cv2.moments(contour)
-
-            # Protect against division by zero.
             if moments['m00'] == 0:
                 continue
 
@@ -152,6 +141,25 @@ def detect_ores(image):
     return center_ore_list, ore_type_list
 
 
+def quat_to_matrix(q):
+    '''
+    Description:
+        Converts a geometry_msgs Quaternion into a 3x3 rotation matrix.
+    '''
+
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(3)
+    s = 2.0 / n
+
+    return np.array([
+        [1 - s * (y * y + z * z), s * (x * y - z * w), s * (x * z + y * w)],
+        [s * (x * y + z * w), 1 - s * (x * x + z * z), s * (y * z - x * w)],
+        [s * (x * z - y * w), s * (y * z + x * w), 1 - s * (x * x + y * y)]
+    ])
+
+
 ##################### CLASS DEFINITION #######################
 
 class ore_tf(Node):
@@ -159,585 +167,372 @@ class ore_tf(Node):
     ___CLASS___
 
     Description:
-        Class which serves the purpose of detecting ores in the cell
-        and broadcasting their positions as TF frames with respect
-        to the robot base frame.
+        Detects ores, converts them to base_link and broadcasts one TF
+        frame per ore. An ore position is the median of N_SAMPLES
+        detections and is then locked, so it stays valid when the arm
+        hides the ore or carries it away.
     '''
 
     def __init__(self):
-        '''
-        Description:
-            Initialization of class ore_tf.
-        '''
 
-        super().__init__('ore_tf_publisher')
-
-        ############ Topic SUBSCRIPTIONS ############
+        super().__init__(
+            'ore_tf_publisher',
+            parameter_overrides=[
+                Parameter('use_sim_time', Parameter.Type.BOOL, True)
+            ]
+        )
 
         self.color_cam_sub = self.create_subscription(
-            Image,
-            color_topic,
-            self.colorimagecb,
-            10
+            Image, color_topic, self.colorimagecb, qos_profile_sensor_data
         )
-
         self.depth_cam_sub = self.create_subscription(
-            Image,
-            depth_topic,
-            self.depthimagecb,
-            10
+            Image, depth_topic, self.depthimagecb, qos_profile_sensor_data
         )
-
         self.cam_info_sub = self.create_subscription(
-            CameraInfo,
-            camera_info_topic,
-            self.caminfocb,
-            10
+            CameraInfo, camera_info_topic, self.caminfocb, qos_profile_sensor_data
         )
 
-        ############ Constructor VARIABLES/OBJECTS ############
-
-        # Time interval between image processing cycles.
-        image_processing_rate = 0.2
-
-        # CvBridge object used for ROS image conversion.
         self.bridge = CvBridge()
-
-        # TF buffer used for looking up camera-to-base transforms.
         self.tf_buffer = tf2_ros.buffer.Buffer()
-
-        # TF listener used to receive available transforms.
-        self.listener = tf2_ros.TransformListener(
-            self.tf_buffer,
-            self
-        )
-
-        # TF broadcaster used to publish ore transforms.
+        self.listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.br = tf2_ros.TransformBroadcaster(self)
 
-        # Timer used to process the images periodically.
-        self.timer = self.create_timer(
-            image_processing_rate,
-            self.process_image
+        # The arm node asks for a fresh detection of one ore on /ore_rescan
+        # (data = ore frame name) and gets the answer on /ore_rescan_done.
+        self.rescanning = {}
+        self.rescan_done_pub = self.create_publisher(String, '/ore_rescan_done', 10)
+        self.rescan_sub = self.create_subscription(
+            String, '/ore_rescan', self.rescancb, 10
         )
 
-        # Latest colour image.
+        self.timer = self.create_timer(0.1, self.process_image)
+
         self.cv_image = None
-
-        # Latest depth image.
         self.depth_image = None
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
 
-        # Latest camera intrinsic information.
-        self.cam_info = None
+        # Candidate ores being tracked: dicts with type, pixel, samples, name.
+        self.tracks = []
 
-        # Stores the last known pixel position of each ore ID.
-        self.ore_positions = {}
-        self.last_base_positions = {}
+        # Locked ore positions in base_link: name -> (x, y, z).
+        self.locked = {}
 
-        # Stores whether the detection image has already been saved.
         self._saved_detection_image = False
 
-        # Stores whether the depth data type has already been logged.
-        self._logged_depth_dtype = False
+        self.get_logger().info('Task 2A perception started.')
 
     def depthimagecb(self, data):
         '''
         Description:
-            Callback function for the aligned depth camera topic.
-            Converts the received ROS depth image into a NumPy array.
-
-        Args:
-            data (Image):
-                Input depth image received from the aligned depth
-                camera topic.
-
-        Returns:
-            None
+            Stores the aligned depth image in metres.
         '''
 
         try:
-
             depth = self.bridge.imgmsg_to_cv2(
-                data,
-                desired_encoding='passthrough'
+                data, desired_encoding='passthrough'
             )
 
-            if not self._logged_depth_dtype:
-                self.get_logger().info(
-                    f'Depth dtype: {depth.dtype}'
-                )
-                self._logged_depth_dtype = True
-
-            # Convert millimetres to metres when using 16-bit depth.
             if depth.dtype == np.uint16:
                 depth = depth.astype(np.float32) / 1000.0
 
             self.depth_image = depth
 
         except CvBridgeError as error:
-            self.get_logger().error(
-                f'Depth image conversion failed: {error}'
-            )
+            self.get_logger().error(f'Depth image conversion failed: {error}')
 
     def colorimagecb(self, data):
         '''
         Description:
-            Callback function for the colour camera topic.
-            Converts the received ROS image into an OpenCV BGR image.
-
-        Args:
-            data (Image):
-                Input colour image received from the camera topic.
-
-        Returns:
-            None
+            Stores the colour image as BGR.
         '''
 
         try:
-
             self.cv_image = self.bridge.imgmsg_to_cv2(
-                data,
-                desired_encoding='bgr8'
+                data, desired_encoding='bgr8'
             )
-
         except CvBridgeError as error:
-            self.get_logger().error(
-                f'Color image conversion failed: {error}'
-            )
+            self.get_logger().error(f'Color image conversion failed: {error}')
 
     def caminfocb(self, data):
         '''
         Description:
-            Callback function for the camera information topic.
-            Stores the camera intrinsic parameters required for
-            3D point calculation.
-
-        Args:
-            data (CameraInfo):
-                Camera calibration information.
-
-        Returns:
-            None
+            Stores the camera intrinsics.
         '''
 
-        self.cam_info = data.k
-
-        # Camera focal lengths.
         self.fx = data.k[0]
         self.fy = data.k[4]
-
-        # Camera principal point.
         self.cx = data.k[2]
         self.cy = data.k[5]
+
+    def now_seconds(self):
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def publish_done(self, name):
+        msg = String()
+        msg.data = name
+        self.rescan_done_pub.publish(msg)
+
+    def rescancb(self, msg):
+        '''
+        Description:
+            Forgets the tracks of one ore and re-detects it from scratch.
+            The old TF stays published until the new position is locked.
+        '''
+
+        name = msg.data.strip()
+
+        if name not in self.locked:
+            self.publish_done(name)
+            return
+
+        if name in self.rescanning:
+            return
+
+        self.tracks = [t for t in self.tracks if t['name'] != name]
+        self.rescanning[name] = {
+            'old': self.locked[name],
+            'start': self.now_seconds()
+        }
+        self.get_logger().info(f'Re-detecting {name}.')
+
+    def sample_depth(self, center_x, center_y):
+        '''
+        Description:
+            Median valid depth in a 9x9 window around a pixel, or None.
+        '''
+
+        patch = self.depth_image[
+            max(center_y - 4, 0):center_y + 5,
+            max(center_x - 4, 0):center_x + 5
+        ]
+
+        valid = patch[np.isfinite(patch) & (patch > 0.0)]
+
+        if valid.size == 0:
+            return None
+
+        return float(np.median(valid))
+
+    def pixel_to_base(self, center_x, center_y, depth, transform):
+        '''
+        Description:
+            Deprojects a pixel with its depth and transforms the point
+            from the camera optical frame to base_link.
+
+        Returns:
+            numpy array [x, y, z] in base_link.
+        '''
+
+        x = (center_x - self.cx) * depth / self.fx
+        y = (center_y - self.cy) * depth / self.fy
+        z = depth
+
+        rotation = quat_to_matrix(transform.transform.rotation)
+        t = transform.transform.translation
+
+        point = rotation @ np.array([x, y, z]) + np.array([t.x, t.y, t.z])
+
+        return point
+
+    def match_track(self, ore_type, center_x, center_y):
+        '''
+        Description:
+            Returns the existing track of this type nearest to the pixel
+            (inside TRACK_RADIUS_PX), or None.
+        '''
+
+        best = None
+        best_dist = TRACK_RADIUS_PX
+
+        for track in self.tracks:
+            if track['type'] != ore_type:
+                continue
+
+            dist = np.hypot(
+                track['px'][0] - center_x, track['px'][1] - center_y
+            )
+
+            if dist <= best_dist:
+                best = track
+                best_dist = dist
+
+        return best
+
+    def publish_locked(self, stamp):
+        '''
+        Description:
+            Broadcasts every locked ore as a TF frame in base_link.
+        '''
+
+        for name, position in self.locked.items():
+
+            msg = TransformStamped()
+            msg.header.stamp = stamp
+            msg.header.frame_id = base_frame
+            msg.child_frame_id = name
+
+            msg.transform.translation.x = position[0]
+            msg.transform.translation.y = position[1]
+            msg.transform.translation.z = position[2]
+
+            msg.transform.rotation.x = 0.0
+            msg.transform.rotation.y = 0.0
+            msg.transform.rotation.z = 0.0
+            msg.transform.rotation.w = 1.0
+
+            self.br.sendTransform(msg)
 
     def process_image(self):
         '''
         Description:
-            Timer function used to detect ores, calculate their
-            3D positions and publish their TF frames.
-
-        Args:
-            None
-
-        Returns:
-            None
+            Timer callback: detects ores, locks their positions and
+            broadcasts the TF frames.
         '''
 
-        ############ Check Required Data ############
+        self.publish_locked(self.get_clock().now().to_msg())
 
-        # Return until a colour image is available.
-        if self.cv_image is None:
+        now = self.now_seconds()
+        for name, info in list(self.rescanning.items()):
+            if now - info['start'] > RESCAN_TIMEOUT_S:
+                del self.rescanning[name]
+                self.get_logger().warn(
+                    f'Re-detection of {name} timed out; keeping the old position.'
+                )
+                self.publish_done(name)
+
+        # All ores found: nothing more to detect. This also keeps the
+        # carried ore and dropped ores from creating extra frames.
+        if len(self.locked) >= EXPECTED_ORES and not self.rescanning:
+            return
+
+        if (
+            self.cv_image is None
+            or self.depth_image is None
+            or self.fx is None
+        ):
             self.get_logger().info(
-                'Waiting for color image...'
+                'Waiting for camera data...', throttle_duration_sec=2.0
+            )
+            return
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                base_frame, cam_frame_id, rclpy.time.Time()
+            )
+        except Exception as error:
+            self.get_logger().warn(
+                f'TF lookup failed: {error}', throttle_duration_sec=2.0
             )
             return
 
         display = self.cv_image.copy()
+        center_ore_list, ore_type_list = detect_ores(self.cv_image)
 
-        # Detect all ores in the current colour frame.
-        center_ore_list, ore_type_list = detect_ores(
-            self.cv_image
-        )
+        for (center_x, center_y), ore_type in zip(center_ore_list, ore_type_list):
 
-        ############ Group Detections by Type ############
-
-        by_type = {}
-
-        for center, ore_type in zip(
-            center_ore_list,
-            ore_type_list
-        ):
-            by_type.setdefault(
-                ore_type,
-                []
-            ).append(center)
-
-        ############ Assign Stable Ore IDs ############
-
-        all_assignments = []
-
-        for ore_type, detections in by_type.items():
-
-            candidate_ids = [
-                f'{ore_type}_1',
-                f'{ore_type}_2'
-            ]
-
-            if len(detections) == 1:
-
-                center_x, center_y = detections[0]
-
-                best_id = None
-                best_distance = float('inf')
-
-                for ore_id in candidate_ids:
-
-                    if ore_id in self.ore_positions:
-
-                        previous_x, previous_y = (
-                            self.ore_positions[ore_id]
-                        )
-
-                        distance = (
-                            (previous_x - center_x) ** 2 +
-                            (previous_y - center_y) ** 2
-                        )
-
-                        if distance < best_distance:
-                            best_distance = distance
-                            best_id = ore_id
-
-                if best_id is None:
-                    best_id = candidate_ids[0]
-
-                assignment = [
-                    (best_id, (center_x, center_y))
-                ]
-
-            elif len(detections) >= 2:
-
-                detection_1 = detections[0]
-                detection_2 = detections[1]
-
-                known_ids = [
-                    ore_id
-                    for ore_id in candidate_ids
-                    if ore_id in self.ore_positions
-                ]
-
-                if len(known_ids) == 2:
-
-                    id_1, id_2 = candidate_ids
-
-                    position_1 = self.ore_positions[id_1]
-                    position_2 = self.ore_positions[id_2]
-
-                    cost_a = (
-                        (position_1[0] - detection_1[0]) ** 2 +
-                        (position_1[1] - detection_1[1]) ** 2 +
-                        (position_2[0] - detection_2[0]) ** 2 +
-                        (position_2[1] - detection_2[1]) ** 2
-                    )
-
-                    cost_b = (
-                        (position_2[0] - detection_1[0]) ** 2 +
-                        (position_2[1] - detection_1[1]) ** 2 +
-                        (position_1[0] - detection_2[0]) ** 2 +
-                        (position_1[1] - detection_2[1]) ** 2
-                    )
-
-                    if cost_a <= cost_b:
-                        assignment = [
-                            (id_1, detection_1),
-                            (id_2, detection_2)
-                        ]
-                    else:
-                        assignment = [
-                            (id_2, detection_1),
-                            (id_1, detection_2)
-                        ]
-
-                elif len(known_ids) == 1:
-
-                    known_id = known_ids[0]
-
-                    if known_id == candidate_ids[0]:
-                        other_id = candidate_ids[1]
-                    else:
-                        other_id = candidate_ids[0]
-
-                    previous_position = self.ore_positions[known_id]
-
-                    distance_1 = (
-                        (previous_position[0] - detection_1[0]) ** 2 +
-                        (previous_position[1] - detection_1[1]) ** 2
-                    )
-
-                    distance_2 = (
-                        (previous_position[0] - detection_2[0]) ** 2 +
-                        (previous_position[1] - detection_2[1]) ** 2
-                    )
-
-                    if distance_1 <= distance_2:
-                        assignment = [
-                            (known_id, detection_1),
-                            (other_id, detection_2)
-                        ]
-                    else:
-                        assignment = [
-                            (known_id, detection_2),
-                            (other_id, detection_1)
-                        ]
-
-                else:
-
-                    assignment = [
-                        (candidate_ids[0], detection_1),
-                        (candidate_ids[1], detection_2)
-                    ]
-
-            else:
-
-                assignment = []
-
-            for ore_id, (center_x, center_y) in assignment:
-
-                self.ore_positions[ore_id] = (
-                    center_x,
-                    center_y
-                )
-
-                all_assignments.append(
-                    (ore_id, center_x, center_y)
-                )
-
-        ############ Draw Detected Ores ############
-
-        for ore_id, center_x, center_y in all_assignments:
-
-            cv2.circle(
-                display,
-                (center_x, center_y),
-                8,
-                (255, 255, 255),
-                2
-            )
-
-            cv2.putText(
-                display,
-                ore_id,
-                (center_x - 40, center_y - 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.4,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA
-            )
-
-        cv2.imshow(
-            'color_feed',
-            display
-        )
-
-        cv2.waitKey(1)
-
-        ############ Save Detection Image ############
-
-        if (
-            not self._saved_detection_image
-            and len(all_assignments) >= 4
-        ):
-
-            save_result = cv2.imwrite(
-                'SC#1449_task2A_detection.png',
-                display
-            )
-
-            self._saved_detection_image = True
-
-            self.get_logger().info(
-                f'Detection image save result: {save_result}'
-            )
-
-        ############ Broadcast Ore TF ############
-
-        if (
-            self.depth_image is not None
-            and hasattr(self, 'fx')
-        ):
-
-            cam_frame_id = 'camera_color_optical_frame'
-
-            current_time = self.get_clock().now().to_msg()
-
-            for ore_id, center_x, center_y in all_assignments:
-
-                # Extract a 9x9 depth window around the ore center.
-                patch = self.depth_image[
-                    max(center_y - 4, 0):center_y + 5,
-                    max(center_x - 4, 0):center_x + 5
-                ]
-
-                # Keep only valid depth measurements.
-                valid_depth = patch[
-                    np.isfinite(patch) &
-                    (patch > 0.0)
-                ]
-
-                if valid_depth.size == 0:
-                    continue
-
-                # Median depth provides a more stable measurement.
-                depth = float(
-                    np.median(valid_depth)
-                )
-
-                # Deproject the pixel into the camera optical frame.
-                x = (
-                    (center_x - self.cx) *
-                    depth /
-                    self.fx
-                )
-
-                y = (
-                    (center_y - self.cy) *
-                    depth /
-                    self.fy
-                )
-
-                z = depth
-
-                ############ Transform Point to Base Frame ############
-
-                point_in_camera = PointStamped()
-
-                point_in_camera.header.frame_id = cam_frame_id
-                point_in_camera.header.stamp = (
-                    rclpy.time.Time().to_msg()
-                )
-
-                point_in_camera.point.x = x
-                point_in_camera.point.y = y
-                point_in_camera.point.z = z
-
-                try:
-
-                    transform = self.tf_buffer.lookup_transform(
-                        base_frame,
-                        cam_frame_id,
-                        rclpy.time.Time()
-                    )
-
-                    point_in_base = do_transform_point(
-                        point_in_camera,
-                        transform
-                    )
-
-                except Exception as error:
-
-                    self.get_logger().warn(
-                        f'TF lookup failed for {ore_id}: {error}'
-                    )
-
-                    continue
-
-                base_x = point_in_base.point.x
-                base_y = point_in_base.point.y
-                base_z = point_in_base.point.z
-
-                # Keep the last valid 3-D position. The arm can hide an ore
-                # from the camera while it is approaching, so the last valid
-                # TF must remain available to the manipulation node.
-                self.last_base_positions[ore_id] = (
-                    float(base_x),
-                    float(base_y),
-                    float(base_z)
-                )
-
-                ############ Publish Transform ############
-
-                transform_msg = TransformStamped()
-
-                transform_msg.header.stamp = current_time
-                transform_msg.header.frame_id = base_frame
-                transform_msg.child_frame_id = ore_id
-
-                transform_msg.transform.translation.x = float(base_x)
-                transform_msg.transform.translation.y = float(base_y)
-                transform_msg.transform.translation.z = float(base_z)
-
-                transform_msg.transform.rotation.w = 1.0
-
-                self.br.sendTransform(
-                    transform_msg
-                )
-
-        # Re-publish cached transforms for ores that are temporarily hidden
-        # by the arm/tool. This keeps their last valid base_link position
-        # available even after the camera view is occluded.
-        visible_ids = {
-            item[0] for item in all_assignments
-        }
-
-        for ore_id, position in self.last_base_positions.items():
-
-            if ore_id in visible_ids:
+            depth = self.sample_depth(center_x, center_y)
+            if depth is None:
                 continue
 
-            transform_msg = TransformStamped()
+            position = self.pixel_to_base(center_x, center_y, depth, transform)
 
-            transform_msg.header.stamp = current_time
-            transform_msg.header.frame_id = base_frame
-            transform_msg.child_frame_id = ore_id
+            # Ignore containers and ores already dropped in them.
+            near_container = any(
+                np.hypot(position[0] - cxm, position[1] - cym)
+                < CONTAINER_EXCLUDE_RADIUS
+                for cxm, cym in CONTAINER_POINTS
+            )
+            if near_container:
+                continue
 
-            transform_msg.transform.translation.x = position[0]
-            transform_msg.transform.translation.y = position[1]
-            transform_msg.transform.translation.z = position[2]
+            track = self.match_track(ore_type, center_x, center_y)
 
-            transform_msg.transform.rotation.x = 0.0
-            transform_msg.transform.rotation.y = 0.0
-            transform_msg.transform.rotation.z = 0.0
-            transform_msg.transform.rotation.w = 1.0
+            if track is None:
+                track = {
+                    'type': ore_type,
+                    'px': (center_x, center_y),
+                    'samples': [],
+                    'name': None
+                }
+                self.tracks.append(track)
 
-            self.br.sendTransform(
-                transform_msg
+            if track['name'] is None:
+                track['samples'].append(position)
+
+                if len(track['samples']) >= N_SAMPLES:
+                    median = np.median(np.array(track['samples']), axis=0)
+                    candidates = [
+                        n for n in self.rescanning
+                        if n.startswith(ore_type + '_')
+                    ]
+
+                    if candidates:
+                        name = min(
+                            candidates,
+                            key=lambda n: float(np.linalg.norm(
+                                np.array(self.rescanning[n]['old']) - median
+                            ))
+                        )
+                        old = self.rescanning.pop(name)['old']
+                        moved = float(np.linalg.norm(np.array(old) - median))
+                        self.get_logger().info(
+                            f'Re-detected {name}: moved {moved * 1000:.0f} mm.'
+                        )
+                    else:
+                        index = 1
+                        while f'{ore_type}_{index}' in self.locked:
+                            index += 1
+                        name = f'{ore_type}_{index}'
+
+                    track['name'] = name
+                    self.locked[name] = (
+                        float(median[0]), float(median[1]), float(median[2])
+                    )
+                    self.get_logger().info(
+                        f'Locked {name}: x={median[0]:.3f}, '
+                        f'y={median[1]:.3f}, z={median[2]:.3f}'
+                    )
+
+                    if candidates:
+                        self.publish_done(name)
+
+            label = track['name'] if track['name'] else ore_type
+            cv2.circle(display, (center_x, center_y), 8, (255, 255, 255), 2)
+            cv2.putText(
+                display, label, (center_x - 40, center_y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA
             )
 
+        if len(self.locked) >= EXPECTED_ORES and not self._saved_detection_image:
+            cv2.imwrite('SC#1449_task2A_detection.png', display)
+            self._saved_detection_image = True
+            self.get_logger().info('All ores locked; detection image saved.')
 
-##################### FUNCTION DEFINITION #######################
+
+##################### MAIN #######################
 
 def main():
     '''
     Description:
-        Main function which creates a ROS node and spins around for
-        the ore_tf class to perform its task.
-
-    Args:
-        None
-
-    Returns:
-        None
+        Creates the ore_tf node and spins it.
     '''
 
     rclpy.init(args=sys.argv)
 
-    node = rclpy.create_node(
-        'ore_tf_process'
-    )
+    node = ore_tf()
 
-    node.get_logger().info(
-        'Node created: Ore tf process'
-    )
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
 
-    ore_tf_class = ore_tf()
+    node.destroy_node()
 
-    rclpy.spin(
-        ore_tf_class
-    )
-
-    ore_tf_class.destroy_node()
-
-    rclpy.shutdown()
+    if rclpy.ok():
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
