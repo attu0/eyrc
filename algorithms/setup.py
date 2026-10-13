@@ -58,5 +58,7 @@ setup(
         'scripts/task1c/task1C.py',
         'scripts/task2a/task2A_perception.py',
         'scripts/task2a/task2A_manipulation.py',
+        'scripts/task2b/task2B_planning.py',
+        'scripts/task2b/task2B_navigation.py',
     ],
 )
