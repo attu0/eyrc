@@ -94,7 +94,7 @@ end_yaw_options = [
 # How far (m) the eBot's centre must stay from any rock. These are tried in order, the
 # first that gives a path is used: big margin = safe but long, small margin = short but
 # riskier. Tune the first value against your eBot's real size and tracking error.
-clearance_levels = (0.42, 0.36, 0.30, 0.24)
+clearance_levels = (0.38, 0.34, 0.30, 0.24)
 
 # Beyond the hard clearance the search is still nudged away from rocks over this extra
 # distance (m), so that it picks the roomier side of a gap.
@@ -110,7 +110,7 @@ path_spacing = 0.25
 
 # The planner works on a coarser copy of the map (the /map is 0.005 m per cell, far finer
 # than needed). A coarse cell is a rock if ANY fine cell inside it is, so it is conservative.
-planning_res = 0.025
+planning_res = 0.0125
 
 # A cell with at least this value is a rock.
 occupied_threshold = 50
