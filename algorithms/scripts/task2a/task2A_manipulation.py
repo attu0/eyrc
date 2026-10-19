@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 
 '''
-StrataCobot (SC) Theme (eYRC 2026-27)
-Task 2A - Ore manipulation
-
-Picks every ore found by the perception node with the magnet and drops it in the
-container for its kind. Velocity control only (no motion-planning package).
-
-Per ore:  HOVER (level, safe height) -> APPROACH -> DESCEND -> magnet ON -> VERIFY ->
-          LIFT (vertical) -> TRANSIT (level) -> DROP_APPROACH -> DROP_DESCEND ->
-          magnet OFF -> DROP_SETTLE -> DROP_RETREAT (vertical) -> next ore
+*****************************************************************************************
+*            ===============================================
+*                       StrataCobot (SC) Theme (eYRC 2026-27)
+*            ===============================================
+*
+*  This script implements Task 2A ore manipulation for StrataCobot (SC).
+*  It picks detected ores and places them in the matching containers.
+*
+*  This software is made available on an "AS IS WHERE IS BASIS".
+*****************************************************************************************
 '''
+
+# Team ID:          [ 1449 ]
+# Author List:      [ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
+# Filename:         task2A_manipulation.py
+# Functions:        quat_to_matrix, __init__, callbacks, motion helpers,
+#                   controller/recovery helpers, ore selection, run_phase, main
+# Global variables: controller names, joint names, drop points and task constants
+# Nodes:             Publishing Topics  - [ /delta_twist_cmds, /delta_joint_cmds, /ore_rescan ]
+#                    Subscribing Topics - [ /tcp_pose_raw, /joint_states, /arm_status,
+#                                           /ore_rescan_done, /ur7e/end_effector/force_magnitude ]
 
 import math
 import re
@@ -151,6 +162,7 @@ LEVEL_TIMEOUT_S = 20.0
 
 
 def quat_to_matrix(q):
+    """Converts a quaternion into a 3x3 rotation matrix."""
     x, y, z, w = q.x, q.y, q.z, q.w
     n = x * x + y * y + z * z + w * w
     if n < 1e-12:
@@ -165,7 +177,10 @@ def quat_to_matrix(q):
 
 class arm_task2a(Node):
 
+    """Controls the arm to pick ores and place them in type-specific containers."""
+
     def __init__(self):
+        """Initialises ROS 2 publishers, subscribers, services, state and timer."""
         super().__init__(
             'task2a_manipulation',
             parameter_overrides=[
@@ -273,9 +288,11 @@ class arm_task2a(Node):
     # ------------------------- CALLBACKS -------------------------
 
     def tcpposecb(self, data):
+        """Stores the latest tool-centre-point pose received from the arm."""
         self.tcp_pose = data.pose
 
     def jointstatecb(self, data):
+        """Stores joint positions in the configured joint order."""
         try:
             self.joint_angles = [
                 data.position[data.name.index(joint)] for joint in joint_names
@@ -284,16 +301,19 @@ class arm_task2a(Node):
             self.joint_angles = None
 
     def armstatuscb(self, data):
+        """Stores arm status and flags protective-stop recovery when needed."""
         self.arm_status = data.data
 
         if self.arm_status in PROTECTIVE_STOP_CODES and not self.in_recovery:
             self.recovery_required = True
 
     def rescandonecb(self, data):
+        """Records completion of the perception node re-scan request."""
         if data.data == self.current_ore:
             self.rescan_done = True
 
     def forcecb(self, data):
+        """Stores force feedback and maintains a short history for verification."""
         self.force_magnitude = float(data.data)
         now = self.now_seconds()
         self.force_hist.append((now, self.force_magnitude))
@@ -302,25 +322,30 @@ class arm_task2a(Node):
     # ------------------------- BASIC HELPERS -------------------------
 
     def now_seconds(self):
+        """Returns the current ROS clock time in seconds."""
         return self.get_clock().now().nanoseconds / 1e9
 
     def stop_twist(self):
+        """Publishes a zero Cartesian velocity command to stop arm motion."""
         msg = TwistStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = base_frame
         self.twist_pub.publish(msg)
 
     def set_phase(self, phase):
+        """Changes the current task phase and resets its elapsed-time reference."""
         self.phase = phase
         self.phase_start_time = self.now_seconds()
         self.get_logger().info(f'Ore={self.current_ore}, phase={phase}')
 
     def phase_elapsed(self):
+        """Returns the elapsed time since the current phase began."""
         if self.phase_start_time is None:
             return 0.0
         return self.now_seconds() - self.phase_start_time
 
     def publish_slow_twist_to(self, target, kp, max_speed, hold_speed=False):
+        """Publishes a bounded Cartesian velocity toward a target pose."""
         error_x = target[0] - self.tcp_pose.position.x
         error_y = target[1] - self.tcp_pose.position.y
         error_z = target[2] - self.tcp_pose.position.z
@@ -355,6 +380,7 @@ class arm_task2a(Node):
         return math.sqrt(error_x ** 2 + error_y ** 2 + error_z ** 2)
 
     def choose_tool_axis(self):
+        """Selects the tool axis that points most nearly downward."""
         R = quat_to_matrix(self.tcp_pose.orientation)
         best = None
         for idx in range(3):
@@ -365,6 +391,7 @@ class arm_task2a(Node):
         self.tool_axis = (best[1], best[2])
 
     def tool_vector(self):
+        """Returns the selected tool axis expressed in the base frame."""
         R = quat_to_matrix(self.tcp_pose.orientation)
         idx, sign = self.tool_axis
         return (sign * R[0][idx], sign * R[1][idx], sign * R[2][idx])
@@ -448,6 +475,7 @@ class arm_task2a(Node):
         return points
 
     def start_path(self, end3):
+        """Plans and stores level waypoints for a safe move to a target."""
         points = self.plan_path_xy(
             (self.tcp_pose.position.x, self.tcp_pose.position.y),
             (end3[0], end3[1])
@@ -509,6 +537,7 @@ class arm_task2a(Node):
     # ------------------------- CONTROLLER SWITCHING -------------------------
 
     def switch_controller(self, controller, strict=True):
+        """Requests a switch between the arm joint and twist controllers."""
         if self.active_controller == controller:
             self.on_switch_done(controller)
             return True
@@ -533,6 +562,7 @@ class arm_task2a(Node):
         return True
 
     def on_switch_done(self, target):
+        """Updates the controller state and chooses the next motion state."""
         self.active_controller = target
         self.switch_retries = 0
         self.get_logger().info(f'Switched to {target}')
@@ -570,6 +600,7 @@ class arm_task2a(Node):
     # ------------------------- UNFOLD / RECOVERY -------------------------
 
     def unfold_arm(self):
+        """Moves the arm joints toward the configured unfolded posture."""
         velocities = []
         max_error = 0.0
 
@@ -597,6 +628,7 @@ class arm_task2a(Node):
         return False
 
     def recover_arm(self):
+        """Raises the shoulder joint during protective-stop recovery."""
         idx = joint_names.index('shoulder_lift_joint')
         current = self.joint_angles[idx]
 
@@ -612,6 +644,7 @@ class arm_task2a(Node):
         return current > -2.80
 
     def handle_recovery(self):
+        """Handles protective-stop unlocking and safe arm recovery."""
         self.stop_twist()
 
         if self.unlock_future is None:
@@ -654,6 +687,7 @@ class arm_task2a(Node):
     # ------------------------- TF / ORE -------------------------
 
     def lookup_ore(self, ore_id):
+        """Looks up an ore transform and returns its position in base_link."""
         try:
             transform = self.tf_buffer.lookup_transform(
                 base_frame, ore_id, rclpy.time.Time()
@@ -664,6 +698,7 @@ class arm_task2a(Node):
             return None
 
     def discover_ores(self):
+        """Finds ore TF frame names published by the perception node."""
         try:
             text = self.tf_buffer.all_frames_as_string()
         except Exception:
@@ -673,6 +708,7 @@ class arm_task2a(Node):
         return sorted(n for n in names if ORE_RE.match(n))
 
     def select_next_ore(self):
+        """Selects the nearest remaining ore or handles task completion."""
         found = self.discover_ores()
         remaining = [
             o for o in found
@@ -749,24 +785,29 @@ class arm_task2a(Node):
         self.set_phase('HOVER')
 
     def ore_hover_target(self):
+        """Returns a safe hover target above the current ore."""
         x, y, z = self.current_ore_position
         return (x, y, max(TRAVEL_Z, z + HOVER_HEIGHT))
 
     def search_offset(self):
+        """Returns the XY search offset for the current pick attempt."""
         return SEARCH_OFFSETS[self.pick_attempt % len(SEARCH_OFFSETS)]
 
     def ore_approach_target(self):
+        """Returns the approach target above the current ore."""
         x, y, z = self.current_ore_position
         ox, oy = self.search_offset()
         return (x + ox, y + oy, z + APPROACH_HEIGHT)
 
     def ore_pick_target(self):
+        """Returns the magnet contact target for the current pick attempt."""
         x, y, z = self.current_ore_position
         ox, oy = self.search_offset()
         extra = PICK_Z_TRIES[self.pick_attempt % len(PICK_Z_TRIES)]
         return (x + ox, y + oy, z + PICK_OFFSET_Z + extra)
 
     def pick_failed(self):
+        """Records a failed pick and schedules a retry or skip sequence."""
         ore = self.current_ore
         self.pick_attempts[ore] = self.pick_attempts.get(ore, 0) + 1
         self.pick_attempt = self.pick_attempts[ore]
@@ -787,14 +828,17 @@ class arm_task2a(Node):
             self.request_magnet(False, 'retry')
 
     def ore_lift_target(self):
+        """Returns the vertical lift target after a confirmed pick."""
         x, y, z = self.current_ore_position
         return (x, y, max(TRAVEL_Z, z + LIFT_HEIGHT))
 
     def drop_travel_target(self):
+        """Returns the safe travel target above the destination container."""
         dx, dy, dz = self.current_drop_position
         return (dx, dy, max(TRAVEL_Z, dz + DROP_APPROACH_HEIGHT))
 
     def drop_approach_target(self):
+        """Returns the approach target above the destination container."""
         dx, dy, dz = self.current_drop_position
         return (dx, dy, dz + DROP_APPROACH_HEIGHT)
 
@@ -805,6 +849,7 @@ class arm_task2a(Node):
         self.magnet_request = (enabled, reason)
 
     def pump_magnet(self):
+        """Sends a queued magnet request when the service is ready."""
         if self.magnet_future is not None or self.magnet_request is None:
             return
 
@@ -825,6 +870,7 @@ class arm_task2a(Node):
         self.magnet_future = self.magnet_client.call_async(request)
 
     def check_magnet_future(self):
+        """Processes the result of an asynchronous magnet service call."""
         if not self.magnet_future.done():
             return
 
@@ -857,6 +903,7 @@ class arm_task2a(Node):
     # ------------------------- MAIN LOOP -------------------------
 
     def process(self):
+        """Runs one control-loop iteration for the current manipulation state."""
         self.pump_magnet()
 
         if self.recovery_required:
@@ -944,6 +991,7 @@ class arm_task2a(Node):
     # ------------------------- PER-ORE PHASES -------------------------
 
     def run_phase(self):
+        """Executes the actions associated with the active per-ore phase."""
         p = self.phase
 
         if p == 'LEVEL':
@@ -1163,6 +1211,7 @@ class arm_task2a(Node):
 
 
 def main(args=None):
+    """Initialises ROS 2, spins the manipulation node and shuts down cleanly."""
     rclpy.init(args=args)
 
     node = arm_task2a()

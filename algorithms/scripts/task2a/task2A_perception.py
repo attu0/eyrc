@@ -174,7 +174,7 @@ class ore_tf(Node):
     '''
 
     def __init__(self):
-
+        """Initialises ROS 2 publishers, subscribers, services, state and timer."""
         super().__init__(
             'ore_tf_publisher',
             parameter_overrides=[
@@ -268,9 +268,11 @@ class ore_tf(Node):
         self.cy = data.k[5]
 
     def now_seconds(self):
+        """Returns the current ROS clock time in seconds."""
         return self.get_clock().now().nanoseconds / 1e9
 
     def publish_done(self, name):
+        """Publishes the completion acknowledgement for an ore re-scan."""
         msg = String()
         msg.data = name
         self.rescan_done_pub.publish(msg)
