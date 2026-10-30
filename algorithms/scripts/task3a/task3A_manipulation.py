@@ -62,20 +62,23 @@ joint_names = [
 
 # Container drop positions in base_link.
 DROP_POINTS = {
-    'azurite_ore': (-0.0700, 0.5500, 0.1500),
-    'malachite_ore': (-0.4000, 0.5500, 0.1500),
-    'vanadinite_ore': (-0.6500, 0.5500, 0.1500),
+    'azurite_ore': (-0.0700, 0.5750, 0.2000),
+    'malachite_ore': (-0.4000, 0.5750, 0.2000),
+    'vanadinite_ore': (-0.6500, 0.5750, 0.2000),
 }
 
 # Ore package (Task 3A). The package is heavier than an ore: the magnet reads about 2.94 N.
 PACKAGE_FRAME = 'ore_package'
 PACKAGE_FORCE_MIN_N = 2.2
 PACKAGE_FORCE_MAX_N = 3.8
+# The eBot is told it may leave once the package is this far above where it was picked,
+# i.e. clear of the deck, without waiting for the arm to reach travel height.
+PACKAGE_CLEAR_LIFT_M = 0.12
 
-# CALIBRATE: where the tool goes to release the package, (x, y, z) in base_link, like DROP_POINTS.
+# Where the tool goes to release the package, (x, y, z) in base_link, like DROP_POINTS (measured).
 # The package hangs below the tool face, so z must leave its underside inside the hopper.
 # Left as None the package is never picked, and the node says so.
-CRUSHER_DROP = None
+CRUSHER_DROP = (-0.7250, 0.0050, 0.4000)
 
 ORE_RE = re.compile(r'^(azurite|malachite|vanadinite)_ore_\d+$')
 
@@ -292,6 +295,7 @@ class arm_task2a(Node):
         self.done_ores = set()
         self.package_ready = False
         self.package_warned = False
+        self.package_taken_sent = False
         self.redetect_names = []
         self.redetect_acks = set()
         self.redetect_resent = False
@@ -878,6 +882,17 @@ class arm_task2a(Node):
         self.start_path(self.ore_hover_target())
         self.set_phase('HOVER')
 
+    def package_waiting(self):
+        '''True when the eBot is beside the arm and the package can be picked now.'''
+
+        return (
+            self.package_ready
+            and CRUSHER_DROP is not None
+            and PACKAGE_FRAME not in self.done_ores
+            and PACKAGE_FRAME not in self.skipped_ores
+            and self.lookup_ore(PACKAGE_FRAME) is not None
+        )
+
     def start_redetect(self):
         '''Asks perception to detect every remaining ore again, leaving out the dropped ones.'''
 
@@ -961,7 +976,11 @@ class arm_task2a(Node):
     # ------------------------- MAGNET -------------------------
 
     def publish_package_taken(self):
-        '''Tells the eBot the package is off its deck, so it may drive home.'''
+        '''Tells the eBot the package is off its deck, so it may drive home (sent once).'''
+        if self.package_taken_sent:
+            return
+
+        self.package_taken_sent = True
         msg = Bool()
         msg.data = True
         self.taken_pub.publish(msg)
@@ -1163,6 +1182,14 @@ class arm_task2a(Node):
         # ---- Pick ----
 
         if p == 'HOVER':
+            # Travelling empty towards an ore at travel height: the package goes first.
+            if self.package_waiting():
+                self.path = None
+                self.stop_twist()
+                self.get_logger().info('eBot is beside the arm: taking the package first.')
+                self.set_phase('SELECT')
+                return
+
             if self.follow_path(TRAVEL_KP, TRAVEL_SPEED, TOL_COARSE):
                 self.set_phase('APPROACH')
             return
@@ -1279,6 +1306,10 @@ class arm_task2a(Node):
             return
 
         if p == 'LIFT':
+            if (self.current_ore == PACKAGE_FRAME and not self.package_taken_sent
+                    and self.tcp_pose.position.z >= self.current_ore_position[2] + PACKAGE_CLEAR_LIFT_M):
+                self.publish_package_taken()                                            # off the deck: the eBot may go
+
             if self.go(self.ore_lift_target(), LIFT_KP, LIFT_SPEED, TOL_FINE):
                 if self.current_ore == PACKAGE_FRAME:
                     self.publish_package_taken()

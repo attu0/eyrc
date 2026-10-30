@@ -62,6 +62,7 @@ setup(
     scripts=[
         'scripts/task1a/task1A.py',
         'scripts/task1b/task1B.py',
+        'scripts/task1b/practice_move_arm.py',
         'scripts/task1c/task1C.py',
         'scripts/task2a/task2A_perception.py',
         'scripts/task2a/task2A_manipulation.py',
