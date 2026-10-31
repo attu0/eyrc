@@ -353,9 +353,10 @@ def main():
         pass
 
     finally:
-        ebot_nav_class.stop_robot()
-        ebot_nav_class.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():                                                                  # a launch file's Ctrl+C may have shut ROS down already
+            ebot_nav_class.stop_robot()
+            ebot_nav_class.destroy_node()
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

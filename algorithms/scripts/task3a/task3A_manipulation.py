@@ -106,7 +106,7 @@ SEARCH_OFFSETS = (
 CONTACT_BACKOFF_M = 0.004
 RESCAN_TIMEOUT_S = 8.0
 # After each drop the remaining ores are detected again; perception answers within 5 s.
-REDETECT_TIMEOUT_S = 5.5
+REDETECT_TIMEOUT_S = 3.5
 LIFT_HEIGHT = 0.16
 
 # Protective stops are codes 20 to 23.
@@ -126,7 +126,7 @@ unfold_target = {
     'wrist_3_joint': 1.57,
 }
 
-unfold_kp = 1.0
+unfold_kp = 2.5
 control_rate = 0.05
 
 # Position tolerances (m).
@@ -135,12 +135,12 @@ TOL_FINE = 0.008
 TOL_COARSE = 0.015
 
 # Speed profiles (kp, max m/s). All maxima stay below cap_linear_mps.
-TRAVEL_KP, TRAVEL_SPEED = 1.5, 0.135
-APPROACH_KP, APPROACH_SPEED = 1.5, 0.13
+TRAVEL_KP, TRAVEL_SPEED = 3.0, 0.135
+APPROACH_KP, APPROACH_SPEED = 2.5, 0.13
 DESCEND_KP, DESCEND_SPEED = 1.5, 0.07
-LIFT_KP, LIFT_SPEED = 1.5, 0.13
-TRANSPORT_KP, TRANSPORT_MAX_SPEED = 1.5, 0.135
-DROP_KP, DROP_MAX_SPEED = 1.5, 0.13
+LIFT_KP, LIFT_SPEED = 3.0, 0.13
+TRANSPORT_KP, TRANSPORT_MAX_SPEED = 3.0, 0.135
+DROP_KP, DROP_MAX_SPEED = 3.0, 0.13
 DROP_DESCEND_SPEED = 0.08
 
 MOVE_TIMEOUT_S = 40.0
@@ -173,6 +173,13 @@ ARC_STEP_DEG = 30.0
 VIA_RADIUS = 0.40
 TOL_ARC = 0.04
 DROP_APPROACH_HEIGHT = 0.10
+
+# Release the magnet at the hover height above the container instead of descending to the drop
+# point first. This skips the descent and the climb back, but the ore falls the extra height
+# (about DROP_APPROACH_HEIGHT), so test that every ore stays in its container before relying on it.
+# The package is heavier and the hopper is the one drop that must not fail, so it still descends.
+DROP_ORES_FROM_HEIGHT = True
+DROP_PACKAGE_FROM_HEIGHT = False
 
 # Tool orientation: keep the tool's pointing axis straight down so the magnet face
 # lies flat on the ore. The axis is found automatically (the tcp axis closest to
@@ -381,9 +388,28 @@ class arm_task2a(Node):
 
     def set_phase(self, phase):
         """Changes the current task phase and resets its elapsed-time reference."""
+        now = self.now_seconds()
+        previous = getattr(self, 'phase', None)
+        started = getattr(self, 'phase_start_time', None)
+        took = (now - started) if started is not None else 0.0
+
+        moved = 0.0
+        start_xyz = getattr(self, 'phase_start_xyz', None)
+        if start_xyz is not None and self.tcp_pose is not None:
+            p = self.tcp_pose.position
+            moved = math.dist(start_xyz, (p.x, p.y, p.z))
+
         self.phase = phase
-        self.phase_start_time = self.now_seconds()
-        self.get_logger().info(f'Ore={self.current_ore}, phase={phase}')
+        self.phase_start_time = now
+        self.phase_start_xyz = (
+            (self.tcp_pose.position.x, self.tcp_pose.position.y, self.tcp_pose.position.z)
+            if self.tcp_pose is not None else None
+        )
+
+        self.get_logger().info(
+            f'Ore={self.current_ore}, phase={phase} '
+            f'(previous {previous}: {took:.1f} s, tool moved {moved:.2f} m)'
+        )
 
     def phase_elapsed(self):
         """Returns the elapsed time since the current phase began."""
@@ -1183,7 +1209,7 @@ class arm_task2a(Node):
 
         if p == 'HOVER':
             # Travelling empty towards an ore at travel height: the package goes first.
-            if self.package_waiting():
+            if self.current_ore != PACKAGE_FRAME and self.package_waiting():
                 self.path = None
                 self.stop_twist()
                 self.get_logger().info('eBot is beside the arm: taking the package first.')
@@ -1310,7 +1336,7 @@ class arm_task2a(Node):
                     and self.tcp_pose.position.z >= self.current_ore_position[2] + PACKAGE_CLEAR_LIFT_M):
                 self.publish_package_taken()                                            # off the deck: the eBot may go
 
-            if self.go(self.ore_lift_target(), LIFT_KP, LIFT_SPEED, TOL_FINE):
+            if self.go(self.ore_lift_target(), LIFT_KP, LIFT_SPEED, TOL_COARSE):
                 if self.current_ore == PACKAGE_FRAME:
                     self.publish_package_taken()
                 self.start_path(self.drop_travel_target())
@@ -1325,8 +1351,16 @@ class arm_task2a(Node):
             return
 
         if p == 'DROP_APPROACH':
-            if self.go(self.drop_approach_target(), DROP_KP, DROP_MAX_SPEED, TOL_FINE):
-                self.set_phase('DROP_DESCEND')
+            if self.go(self.drop_approach_target(), DROP_KP, DROP_MAX_SPEED, TOL_COARSE):
+                from_height = (
+                    DROP_PACKAGE_FROM_HEIGHT if self.current_ore == PACKAGE_FRAME
+                    else DROP_ORES_FROM_HEIGHT
+                )
+                if from_height:
+                    self.set_phase('DROP_RELEASE')
+                    self.request_magnet(False, 'drop')
+                else:
+                    self.set_phase('DROP_DESCEND')
             return
 
         if p == 'DROP_DESCEND':
