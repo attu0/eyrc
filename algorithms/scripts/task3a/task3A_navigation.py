@@ -45,17 +45,17 @@ path_topic = '/ebot_path'
 odom_topic = '/odom'
 cmd_topic = '/cmd_vel'
 
-max_linear_mps = 0.5
-max_angular_rps = 1.0
+max_linear_mps = 0.50
+max_angular_rps = 0.95
 
-cruise_speed = 0.35             # straight-line speed (m/s)
-lookahead_dist = 0.30           # how far ahead on the path to aim (m)
-finish_dist = 0.08              # position tolerance at the end of the path (m)
-retry_dist = 0.12               # if still further than this after the final turn, creep back to the end point (m)
+cruise_speed = 0.485            # straight-line speed (m/s)
+lookahead_dist = 0.34           # how far ahead on the path to aim (m)
+finish_dist = 0.14              # position tolerance at the end of the path (m)
+retry_dist = 0.20               # if still further than this after the final turn, creep back to the end point (m)
 max_retries = 2                 # how many such corrections per step
-finish_yaw = 0.04               # yaw tolerance at the end of the path (rad)
-turn_in_place_above = 0.60      # heading error above which the eBot first turns on the spot (rad)
-turn_in_place_below = 0.20      # ... and resumes driving once the error is below this (rad)
+finish_yaw = 0.07               # yaw tolerance at the end of the path (rad)
+turn_in_place_above = 0.70      # heading error above which the eBot first turns on the spot (rad)
+turn_in_place_below = 0.28      # ... and resumes driving once the error is below this (rad)
 
 
 ##################### CLASS DEFINITION #######################
@@ -97,7 +97,7 @@ class ebot_nav(Node):
 
         ############ Constructor VARIABLES/OBJECTS ############
 
-        self.timer = self.create_timer(0.05, self.process_navigation)                   # 20 Hz control loop
+        self.timer = self.create_timer(0.04, self.process_navigation)                   # 25 Hz control loop
 
         self.route = None                                                               # [(x, y), ...] of the current step
         self.final_yaw = 0.0                                                            # yaw to finish with (last pose of the path)
@@ -272,9 +272,9 @@ class ebot_nav(Node):
                     return
 
                 msg = Twist()
-                turn = self.clamp(2.0 * error, -0.8, 0.8)
-                if abs(turn) < 0.12:                                                    # keep a minimum so it never stalls
-                    turn = math.copysign(0.12, error)
+                turn = self.clamp(2.5 * error, -0.9, 0.9)
+                if abs(turn) < 0.16:                                                    # keep a minimum so it never stalls
+                    turn = math.copysign(0.16, error)
                 msg.angular.z = turn
                 self.cmd_pub.publish(msg)
                 return
@@ -288,7 +288,7 @@ class ebot_nav(Node):
                 math.atan2(target_y - self.y, target_x - self.x) - self.yaw)
 
             # Arrived: close enough to the last point, or just overshot it.
-            if dist_end < finish_dist or (dist_end < 0.20 and abs(heading_error) > 1.0):
+            if dist_end < finish_dist or (dist_end < 0.24 and abs(heading_error) > 1.0):
                 self.phase = 'align'
                 self.stop_robot()
                 return
@@ -299,9 +299,9 @@ class ebot_nav(Node):
                 if abs(heading_error) < turn_in_place_below:
                     self.phase = 'track'
                 else:
-                    turn = self.clamp(1.8 * heading_error, -max_angular_rps, max_angular_rps)
-                    if abs(turn) < 0.15:
-                        turn = math.copysign(0.15, heading_error)
+                    turn = self.clamp(2.3 * heading_error, -max_angular_rps, max_angular_rps)
+                    if abs(turn) < 0.20:
+                        turn = math.copysign(0.20, heading_error)
                     msg.angular.z = turn
                     self.cmd_pub.publish(msg)
                     return
@@ -311,10 +311,10 @@ class ebot_nav(Node):
                 self.stop_robot()
                 return
 
-            msg.angular.z = self.clamp(2.0 * heading_error, -max_angular_rps, max_angular_rps)
+            msg.angular.z = self.clamp(2.2 * heading_error, -max_angular_rps, max_angular_rps)
 
-            speed = cruise_speed * max(0.25, 1.0 - abs(heading_error) / 0.8)           # slow down in turns
-            speed = min(speed, 0.6 * dist_end + 0.04)                                   # slow down towards the end
+            speed = cruise_speed * max(0.35, 1.0 - abs(heading_error) / 1.0)           # keep momentum in curves
+            speed = min(speed, 1.15 * dist_end + 0.08)                                 # fast approach into the goal tolerance
             msg.linear.x = self.clamp(speed, 0.0, max_linear_mps)
 
             self.cmd_pub.publish(msg)

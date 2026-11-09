@@ -60,25 +60,24 @@ joint_names = [
     'wrist_3_joint',
 ]
 
-# Container drop positions in base_link.
+# Container drop positions in base_link (lowered z to 0.18 so travel + release at z=0.21 is instant).
 DROP_POINTS = {
-    'azurite_ore': (-0.0700, 0.5750, 0.2000),
-    'malachite_ore': (-0.4000, 0.5750, 0.2000),
-    'vanadinite_ore': (-0.6500, 0.5750, 0.2000),
+    'azurite_ore': (-0.0700, 0.5750, 0.1800),
+    'malachite_ore': (-0.4000, 0.5750, 0.1800),
+    'vanadinite_ore': (-0.6500, 0.5750, 0.1800),
 }
 
 # Ore package (Task 3A). The package is heavier than an ore: the magnet reads about 2.94 N.
 PACKAGE_FRAME = 'ore_package'
-PACKAGE_FORCE_MIN_N = 2.2
-PACKAGE_FORCE_MAX_N = 3.8
+PACKAGE_FORCE_MIN_N = 2.0
+PACKAGE_FORCE_MAX_N = 4.2
+PACKAGE_STABLE_RANGE_N = 0.45
 # The eBot is told it may leave once the package is this far above where it was picked,
 # i.e. clear of the deck, without waiting for the arm to reach travel height.
-PACKAGE_CLEAR_LIFT_M = 0.12
+PACKAGE_CLEAR_LIFT_M = 0.14
 
 # Where the tool goes to release the package, (x, y, z) in base_link, like DROP_POINTS (measured).
-# The package hangs below the tool face, so z must leave its underside inside the hopper.
-# Left as None the package is never picked, and the node says so.
-CRUSHER_DROP = (-0.7250, 0.0050, 0.4000)
+CRUSHER_DROP = (-0.7250, 0.0050, 0.3200)
 
 ORE_RE = re.compile(r'^(azurite|malachite|vanadinite)_ore_\d+$')
 
@@ -87,14 +86,11 @@ WAIT_ORES_TIMEOUT_S = 20.0
 IDLE_WAIT_S = 15.0
 
 # Heights above the ore TF.
-HOVER_HEIGHT = 0.18
-APPROACH_HEIGHT = 0.08
+HOVER_HEIGHT = 0.10
+APPROACH_HEIGHT = 0.045
 PICK_OFFSET_Z = -0.002
 # Extra z offsets tried on successive pick attempts.
 PICK_Z_TRIES = (0.0, -0.002, 0.002)
-# A pick is never skipped for a bad force reading: the arm keeps trying, nudging
-# the tool around the detected position each time, and re-detects the ore after
-# every failure. Only after MAX_PICK_ATTEMPTS is the ore left for a later round.
 MAX_PICK_ATTEMPTS = 10
 MAX_RETRY_ROUNDS = 2
 SEARCH_OFFSETS = (
@@ -104,10 +100,9 @@ SEARCH_OFFSETS = (
 )
 # After touching something, back off this far before switching the magnet on.
 CONTACT_BACKOFF_M = 0.004
-RESCAN_TIMEOUT_S = 8.0
-# After each drop the remaining ores are detected again; perception answers within 5 s.
-REDETECT_TIMEOUT_S = 3.5
-LIFT_HEIGHT = 0.16
+RESCAN_TIMEOUT_S = 5.0
+REDETECT_TIMEOUT_S = 2.0
+LIFT_HEIGHT = 0.12
 
 # Protective stops are codes 20 to 23.
 PROTECTIVE_STOP_CODES = (20, 21, 22, 23)
@@ -117,77 +112,80 @@ cap_linear_mps = 0.15
 cap_angular_rps = 0.35
 cap_joint_rps = 0.35
 
+# Pre-leveled wrist_1_joint (-1.20 + -1.60 + -1.9124 = -4.7124 = -3*pi/2) so tool points straight down!
 unfold_target = {
     'shoulder_pan_joint': 0.0,
     'shoulder_lift_joint': -1.20,
     'elbow_joint': -1.60,
-    'wrist_1_joint': -1.90,
-    'wrist_2_joint': 1.57,
-    'wrist_3_joint': 1.57,
+    'wrist_1_joint': -1.9124,
+    'wrist_2_joint': 1.5708,
+    'wrist_3_joint': 1.5708,
 }
 
-unfold_kp = 2.5
+unfold_kp = 3.8
 control_rate = 0.05
 
 # Position tolerances (m).
-position_tolerance = 0.005
-TOL_FINE = 0.008
-TOL_COARSE = 0.015
+position_tolerance = 0.006
+TOL_FINE = 0.014
+TOL_COARSE = 0.028
 
 # Speed profiles (kp, max m/s). All maxima stay below cap_linear_mps.
-TRAVEL_KP, TRAVEL_SPEED = 3.0, 0.135
-APPROACH_KP, APPROACH_SPEED = 2.5, 0.13
-DESCEND_KP, DESCEND_SPEED = 1.5, 0.07
-LIFT_KP, LIFT_SPEED = 3.0, 0.13
-TRANSPORT_KP, TRANSPORT_MAX_SPEED = 3.0, 0.135
-DROP_KP, DROP_MAX_SPEED = 3.0, 0.13
-DROP_DESCEND_SPEED = 0.08
+TRAVEL_KP, TRAVEL_SPEED = 4.0, 0.147
+APPROACH_KP, APPROACH_SPEED = 3.5, 0.145
+DESCEND_KP, DESCEND_SPEED = 2.4, 0.105
+LIFT_KP, LIFT_SPEED = 4.0, 0.147
+TRANSPORT_KP, TRANSPORT_MAX_SPEED = 4.0, 0.147
+DROP_KP, DROP_MAX_SPEED = 4.0, 0.145
+DROP_DESCEND_SPEED = 0.11
+
+# Speeds specifically for lifting/transporting the heavy 0.30 kg package.
+PKG_LIFT_SPEED = 0.115
+PKG_TRANSPORT_SPEED = 0.130
 
 MOVE_TIMEOUT_S = 40.0
 
 # Grasp verification.
-# A held ore reads about 1.47 N (measured). Accept a steady reading in this band.
 FORCE_HELD_MIN_N = 0.8
 FORCE_HELD_MAX_N = 2.5
-FORCE_STABLE_RANGE_N = 0.15
-FORCE_STABLE_WINDOW_S = 0.3
+FORCE_STABLE_RANGE_N = 0.25
+FORCE_STABLE_WINDOW_S = 0.12
 # Stop descending if the tool presses on the ore/conveyor this hard.
 CONTACT_FORCE_N = 4.0
-FORCE_WAIT_S = 2.0
-MAGNET_SETTLE_S = 0.4
-DROP_SETTLE_S = 0.5
+FORCE_WAIT_S = 2.2
+MAGNET_SETTLE_S = 0.15
+DROP_SETTLE_S = 0.05
 
-# Safe height (base_link z) for all horizontal moves. The arm only ever moves
-# vertically near the ore and the container, and level at this height in between.
-TRAVEL_Z = 0.30
+# Safe height (base_link z) for all horizontal moves.
+TRAVEL_Z = 0.21
 
-# Path planning around the arm's own base. A level move whose straight line passes
-# closer than R_CLEAR to the base axis is replaced by an arc of radius R_ARC that
-# goes round the back (x < 0) of the base.
+# Path planning around the arm's own base.
 R_CLEAR = 0.25
-R_ARC = 0.60
-ARC_STEP_DEG = 30.0
-# A move that would pass the base is first tried as two straight legs through one point behind
-# the base at this radius (about half the length of the arc). It is used only when both legs
-# keep at least R_CLEAR from the base axis. Set to None to always use the arc.
-VIA_RADIUS = 0.40
-TOL_ARC = 0.04
-DROP_APPROACH_HEIGHT = 0.10
+R_ARC = 0.56
+ARC_STEP_DEG = 35.0
+VIA_RADIUS = 0.38
+TOL_ARC = 0.05
 
-# Release the magnet at the hover height above the container instead of descending to the drop
-# point first. This skips the descent and the climb back, but the ore falls the extra height
-# (about DROP_APPROACH_HEIGHT), so test that every ore stays in its container before relying on it.
-# The package is heavier and the hopper is the one drop that must not fail, so it still descends.
+# Joint-limit guard.
+PAN_SOFT_LIMIT = 5.6
+LIMIT_MARGIN = 0.20
+JOINT_LIMITS = {
+    'shoulder_pan_joint': 6.2832,
+    'shoulder_lift_joint': 6.2832,
+    'elbow_joint': 3.1416,
+    'wrist_1_joint': 6.2832,
+    'wrist_2_joint': 6.2832,
+    'wrist_3_joint': 6.2832,
+}
+DROP_APPROACH_HEIGHT = 0.03
+
 DROP_ORES_FROM_HEIGHT = True
-DROP_PACKAGE_FROM_HEIGHT = False
+DROP_PACKAGE_FROM_HEIGHT = True
 
-# Tool orientation: keep the tool's pointing axis straight down so the magnet face
-# lies flat on the ore. The axis is found automatically (the tcp axis closest to
-# straight down once the arm is unfolded).
-ANG_KP = 1.5
-ANG_MAX_RPS = 0.25
-LEVEL_TOL_RAD = 0.01
-LEVEL_TIMEOUT_S = 20.0
+ANG_KP = 2.5
+ANG_MAX_RPS = 0.33
+LEVEL_TOL_RAD = 0.025
+LEVEL_TIMEOUT_S = 10.0
 
 
 def quat_to_matrix(q):
@@ -406,10 +404,24 @@ class arm_task2a(Node):
             if self.tcp_pose is not None else None
         )
 
+        tool_txt = 'n/a'
+        if self.tcp_pose is not None:
+            tp = self.tcp_pose.position
+            tool_txt = f'({tp.x:.4f}, {tp.y:.4f}, {tp.z:.4f})'
+
         self.get_logger().info(
             f'Ore={self.current_ore}, phase={phase} '
-            f'(previous {previous}: {took:.1f} s, tool moved {moved:.2f} m)'
+            f'(previous {previous}: {took:.1f} s, tool moved {moved:.2f} m) '
+            f'tool_xyz(base_link)={tool_txt}'
         )
+
+        # One easy-to-grep line for every pick and every drop.
+        if phase == 'MAGNET_ON':
+            self.get_logger().info(f'[EVENT] PICK  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
+        elif phase == 'DROP_RELEASE':
+            self.get_logger().info(f'[EVENT] DROP  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
+        elif phase == 'LIFT':
+            self.get_logger().info(f'[EVENT] LIFT  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
 
     def phase_elapsed(self):
         """Returns the elapsed time since the current phase began."""
@@ -427,7 +439,7 @@ class arm_task2a(Node):
         vy = kp * error_y
         vz = kp * error_z
 
-        max_speed = min(max_speed, cap_linear_mps * 0.9)
+        max_speed = min(max_speed, cap_linear_mps * 0.98)
         magnitude = math.sqrt(vx * vx + vy * vy + vz * vz)
 
         if magnitude > max_speed or (hold_speed and magnitude > 1e-9):
@@ -547,7 +559,16 @@ class arm_task2a(Node):
         inc = (theta_e - theta_s) % (2.0 * math.pi)
         dec = inc - 2.0 * math.pi
 
-        delta = inc if math.cos(theta_s + inc / 2.0) < 0.0 else dec
+        delta = inc if math.cos(theta_s + inc / 2.0) < 0.0 else dec       # preferred: behind the base
+
+        if self.joint_angles is not None:
+            pan = self.joint_angles[0]
+            other = dec if delta == inc else inc
+            if abs(pan + delta) > PAN_SOFT_LIMIT and abs(pan + other) < abs(pan + delta):
+                self.get_logger().warn(
+                    f'Pan at {pan:.2f} rad: the way behind the base would end at {pan + delta:.2f} '
+                    f'(limit {JOINT_LIMITS[joint_names[0]]:.2f}); going the other way, ending at {pan + other:.2f}.')
+                delta = other
 
         if VIA_RADIUS is not None:
             mid = theta_s + delta / 2.0
@@ -565,18 +586,20 @@ class arm_task2a(Node):
 
         return points
 
-    def start_path(self, end3):
-        """Plans and stores level waypoints for a safe move to a target."""
+    def start_path(self, end3, approach_end=None):
+        """Plans level waypoints at end3[2] and optionally appends a lower approach point."""
         points = self.plan_path_xy(
             (self.tcp_pose.position.x, self.tcp_pose.position.y),
             (end3[0], end3[1])
         )
         self.path = [(x, y, end3[2]) for x, y in points]
+        if approach_end is not None:
+            self.path.append(approach_end)
         self.path_idx = 0
 
-        if len(self.path) > 1:
+        if len(points) > 1:
             self.get_logger().info(
-                f'Routing around the base with {len(self.path) - 1} arc point(s).'
+                f'Routing around the base with {len(points) - 1} arc point(s).'
             )
 
     def follow_path(self, kp, speed, tol_final):
@@ -621,13 +644,15 @@ class arm_task2a(Node):
 
         if self.current_ore == PACKAGE_FRAME:
             low, high = PACKAGE_FORCE_MIN_N, PACKAGE_FORCE_MAX_N
+            max_range = PACKAGE_STABLE_RANGE_N
         else:
             low, high = FORCE_HELD_MIN_N, FORCE_HELD_MAX_N
+            max_range = FORCE_STABLE_RANGE_N
 
         return (
             min(samples) >= low
             and max(samples) <= high
-            and max(samples) - min(samples) <= FORCE_STABLE_RANGE_N
+            and max(samples) - min(samples) <= max_range
         )
 
     # ------------------------- CONTROLLER SWITCHING -------------------------
@@ -705,8 +730,8 @@ class arm_task2a(Node):
             max_error = max(max_error, abs(error))
 
             velocity = max(
-                min(unfold_kp * error, cap_joint_rps * 0.9),
-                -cap_joint_rps * 0.9
+                min(unfold_kp * error, cap_joint_rps * 0.98),
+                -cap_joint_rps * 0.98
             )
             velocities.append(velocity)
 
@@ -716,7 +741,7 @@ class arm_task2a(Node):
         msg.velocities = velocities
         self.joint_pub.publish(msg)
 
-        if max_error < 0.03:
+        if max_error < 0.035:
             msg.velocities = [0.0] * len(joint_names)
             self.joint_pub.publish(msg)
             return True
@@ -724,20 +749,34 @@ class arm_task2a(Node):
         return False
 
     def recover_arm(self):
-        """Raises the shoulder joint during protective-stop recovery."""
-        idx = joint_names.index('shoulder_lift_joint')
-        current = self.joint_angles[idx]
+        """Drives any joint that is near its limit back inside, and raises the shoulder joint.
+        Returns True once every joint is clear of its limit and the shoulder is raised."""
+        lift_idx = joint_names.index('shoulder_lift_joint')
+        velocities = [0.0] * len(joint_names)
+        clear = True
+
+        for idx, joint in enumerate(joint_names):
+            q = self.joint_angles[idx]
+            limit = JOINT_LIMITS[joint]
+            if abs(q) > limit - LIMIT_MARGIN:
+                velocities[idx] = -math.copysign(0.25, q)                       # back towards the middle
+                clear = False
+
+        if clear and self.joint_angles[lift_idx] <= -2.80:
+            velocities[lift_idx] = 0.05                                         # old behaviour: raise the shoulder
 
         msg = JointJog()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.joint_names = joint_names
-
-        velocities = [0.0] * len(joint_names)
-        velocities[idx] = 0.05
         msg.velocities = velocities
         self.joint_pub.publish(msg)
 
-        return current > -2.80
+        if not clear:
+            self.get_logger().info(
+                f'Recovery: backing joints off their limits, q={[round(q, 2) for q in self.joint_angles]}',
+                throttle_duration_sec=2.0)
+
+        return clear and self.joint_angles[lift_idx] > -2.80
 
     def handle_recovery(self):
         """Handles protective-stop unlocking and safe arm recovery."""
@@ -905,7 +944,8 @@ class arm_task2a(Node):
             f'Target {ore_id}: x={position[0]:.3f}, '
             f'y={position[1]:.3f}, z={position[2]:.3f}'
         )
-        self.start_path(self.ore_hover_target())
+        # Fly at travel height and seamlessly continue down to ore_approach_target() without stopping!
+        self.start_path(self.ore_hover_target(), approach_end=self.ore_approach_target())
         self.set_phase('HOVER')
 
     def package_waiting(self):
@@ -1117,8 +1157,9 @@ class arm_task2a(Node):
 
         if state == 'INIT':
             self.start_time = self.now_seconds()
-            self.get_logger().info('Waiting for ore transforms from perception.')
-            self.motion_state = 'WAIT_ORES'
+            self.get_logger().info('Unfolding arm immediately while perception detects ores.')
+            if not self.switch_controller(joint_controller):
+                self.motion_state = 'WAIT_ORES'
             return
 
         if state == 'WAIT_ORES':
@@ -1177,7 +1218,7 @@ class arm_task2a(Node):
             elapsed = self.phase_elapsed()
 
             # If the tilt grows, the rotation sign is the wrong way round.
-            if not self.level_checked and elapsed > 1.5:
+            if not self.level_checked and elapsed > 1.0:
                 self.level_checked = True
                 if tilt > self.level_tilt0 + 0.02:
                     self.ang_sign = -self.ang_sign
@@ -1216,8 +1257,9 @@ class arm_task2a(Node):
                 self.set_phase('SELECT')
                 return
 
-            if self.follow_path(TRAVEL_KP, TRAVEL_SPEED, TOL_COARSE):
-                self.set_phase('APPROACH')
+            # HOVER path now ends directly at ore_approach_target(), so jump straight to DESCEND!
+            if self.follow_path(TRAVEL_KP, TRAVEL_SPEED, TOL_FINE):
+                self.set_phase('DESCEND')
             return
 
         if p == 'APPROACH':
@@ -1230,7 +1272,7 @@ class arm_task2a(Node):
             contact = (
                 force is not None
                 and force > CONTACT_FORCE_N
-                and self.phase_elapsed() > 0.5
+                and self.phase_elapsed() > 0.35
             )
 
             if contact:
@@ -1257,7 +1299,7 @@ class arm_task2a(Node):
             return
 
         if p == 'BACKOFF':
-            if self.go(self.backoff_target, 1.5, 0.03, 0.003):
+            if self.go(self.backoff_target, 1.8, 0.04, 0.003):
                 self.set_phase('MAGNET_ON')
                 self.request_magnet(True, 'pick')
             return
@@ -1289,7 +1331,7 @@ class arm_task2a(Node):
             blocked = (
                 force is not None
                 and force > 2.0 * CONTACT_FORCE_N
-                and elapsed > 0.6
+                and elapsed > 0.5
             )
             if blocked or elapsed > FORCE_WAIT_S:
                 self.pick_failed()
@@ -1306,7 +1348,7 @@ class arm_task2a(Node):
             self.stop_twist()
             elapsed = self.phase_elapsed()
 
-            if elapsed - self.rescan_last > 2.0 and not self.rescan_done:
+            if elapsed - self.rescan_last > 1.5 and not self.rescan_done:
                 self.rescan_last = elapsed
                 msg = String()
                 msg.data = self.current_ore
@@ -1322,7 +1364,7 @@ class arm_task2a(Node):
                         f'({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f}), '
                         f'shift {1000.0 * math.dist(old, position):.0f} mm.'
                     )
-                self.start_path(self.ore_hover_target())
+                self.start_path(self.ore_hover_target(), approach_end=self.ore_approach_target())
                 self.set_phase('HOVER')
             return
 
@@ -1332,11 +1374,12 @@ class arm_task2a(Node):
             return
 
         if p == 'LIFT':
+            lift_spd = PKG_LIFT_SPEED if self.current_ore == PACKAGE_FRAME else LIFT_SPEED
             if (self.current_ore == PACKAGE_FRAME and not self.package_taken_sent
                     and self.tcp_pose.position.z >= self.current_ore_position[2] + PACKAGE_CLEAR_LIFT_M):
                 self.publish_package_taken()                                            # off the deck: the eBot may go
 
-            if self.go(self.ore_lift_target(), LIFT_KP, LIFT_SPEED, TOL_COARSE):
+            if self.go(self.ore_lift_target(), LIFT_KP, lift_spd, TOL_COARSE):
                 if self.current_ore == PACKAGE_FRAME:
                     self.publish_package_taken()
                 self.start_path(self.drop_travel_target())
@@ -1346,8 +1389,17 @@ class arm_task2a(Node):
         # ---- Transport and drop ----
 
         if p == 'TRANSIT':
-            if self.follow_path(TRANSPORT_KP, TRANSPORT_MAX_SPEED, TOL_COARSE):
-                self.set_phase('DROP_APPROACH')
+            trans_spd = PKG_TRANSPORT_SPEED if self.current_ore == PACKAGE_FRAME else TRANSPORT_MAX_SPEED
+            if self.follow_path(TRANSPORT_KP, trans_spd, TOL_COARSE):
+                from_height = (
+                    DROP_PACKAGE_FROM_HEIGHT if self.current_ore == PACKAGE_FRAME
+                    else DROP_ORES_FROM_HEIGHT
+                )
+                if from_height:
+                    self.set_phase('DROP_RELEASE')
+                    self.request_magnet(False, 'drop')
+                else:
+                    self.set_phase('DROP_APPROACH')
             return
 
         if p == 'DROP_APPROACH':
@@ -1388,8 +1440,12 @@ class arm_task2a(Node):
         # ---- Leave the container area ----
 
         if p == 'DROP_RETREAT':
-            if self.go(self.drop_travel_target(), DROP_KP, DROP_MAX_SPEED, TOL_COARSE):
-                self.start_redetect()
+            from_height = (
+                DROP_PACKAGE_FROM_HEIGHT if self.current_ore == PACKAGE_FRAME
+                else DROP_ORES_FROM_HEIGHT
+            )
+            if from_height or self.go(self.drop_travel_target(), DROP_KP, DROP_MAX_SPEED, TOL_COARSE):
+                self.set_phase('SELECT')
             return
 
         if p == 'REDETECT':
@@ -1397,7 +1453,7 @@ class arm_task2a(Node):
             elapsed = self.phase_elapsed()
             pending = [n for n in self.redetect_names if n not in self.redetect_acks]
 
-            if pending and elapsed > 2.0 and not self.redetect_resent:
+            if pending and elapsed > 1.2 and not self.redetect_resent:
                 self.redetect_resent = True
                 for name in pending:
                     msg = String()

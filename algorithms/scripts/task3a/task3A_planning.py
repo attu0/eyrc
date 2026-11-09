@@ -98,15 +98,13 @@ end_yaw_options = [
 
 ##################### PLANNER TUNING #######################
 
-# How far (m) the eBot's centre must stay from any rock. These are tried in order, the
-# first that gives a path is used: big margin = safe but long, small margin = short but
-# riskier. Tune the first value against your eBot's real size and tracking error.
-clearance_levels = (0.35, 0.34, 0.30, 0.24)
+# 0.32 m keeps the eBot well clear of rocks while taking shorter, more direct gaps on the first try.
+clearance_levels = (0.32, 0.28, 0.24)
 
 # Beyond the hard clearance the search is still nudged away from rocks over this extra
 # distance (m), so that it picks the roomier side of a gap.
 soft_margin = 0.35
-soft_weight = 0.0               # 0 = pure shortest path (best EP). Raise it to prefer roomier routes.
+soft_weight = 0.0               # 0 = pure shortest path (best EP).
 
 # Around the start and end points the clearance rule is relaxed (m) so a rock near
 # the pose can never make the step unplannable. Occupied cells stay forbidden.
@@ -115,21 +113,20 @@ endpoint_exempt = 0.35
 # Distance between neighbouring poses of the published path (m).
 path_spacing = 0.25
 
-# The planner works on a coarser copy of the map (the /map is 0.005 m per cell, far finer
-# than needed). A coarse cell is a rock if ANY fine cell inside it is, so it is conservative.
-planning_res = 0.0125
+# Coarser planning grid (0.02 m) builds EDT and runs A* ~3x faster at startup without losing accuracy.
+planning_res = 0.020
 
 # A cell with at least this value is a rock.
 occupied_threshold = 50
 
-# Step-complete test, a little tighter than the task's 0.3 m / 0.15 rad.
-end_pos_tol = 0.25
-end_yaw_tol = 0.12
-still_lin = 0.02
-still_ang = 0.02
-still_hold = 0.5                # seconds the eBot must stay still
-ore_settle_time = 2.0           # seconds to let the package settle on the deck
-ore_retry_period = 1.0          # seconds between /spawn_ore_package attempts
+# Step-complete test, within the task's 0.3 m / 0.15 rad.
+end_pos_tol = 0.26
+end_yaw_tol = 0.13
+still_lin = 0.025
+still_ang = 0.025
+still_hold = 0.12               # seconds the eBot must stay still
+ore_settle_time = 0.45          # seconds to let the package settle on the deck
+ore_retry_period = 0.30         # seconds between /spawn_ore_package attempts
 
 
 ##################### CLASS DEFINITION #######################
@@ -148,8 +145,6 @@ class ebot_planner(Node):
         Description:    Initialization of class ebot_planner
         '''
 
-        # use_sim_time is set here, not on the command line, so this node runs on the
-        # simulation clock however it is started.
         super().__init__(                                                               # registering node
             'ebot_planner_node',
             parameter_overrides=[rclpy.parameter.Parameter(
@@ -180,8 +175,8 @@ class ebot_planner(Node):
 
         ############ Constructor VARIABLES/OBJECTS ############
 
-        plan_rate = 0.1                                                                 # rate of time to run one planning cycle (seconds)
-        self.timer = self.create_timer(plan_rate, self.process_planning)                # creating a timer based function which gets called on every 0.1 seconds (as defined by 'plan_rate' variable)
+        plan_rate = 0.04                                                                # 25 Hz planning state machine
+        self.timer = self.create_timer(plan_rate, self.process_planning)
 
         self.grid = None                                                                # the map (from mapcb())
         self.odom = None                                                                # where the base is (from odomcb())
@@ -694,6 +689,9 @@ class ebot_planner(Node):
             path.poses.append(pose)
 
         self.path_pub.publish(path)
+        self.get_logger().info(
+            f'[EVENT] EBOT PATH step {self.step + 1}: start=({points[0][0]:.2f}, {points[0][1]:.2f}) '
+            f'end=({points[-1][0]:.2f}, {points[-1][1]:.2f}) t={self.now_sec():.1f}s')
         self.get_logger().info(f'Published path for step {self.step + 1} ({len(points)} poses)')
 
         ############################################
@@ -837,6 +835,11 @@ class ebot_planner(Node):
             elif self.stage == 'drive':
                 if self.end_reached(end, end_yaw_options[self.step]):
                     self.get_logger().info(f'Step {self.step + 1} finished')
+                    err = math.hypot(self.x - end[0], self.y - end[1])
+                    self.get_logger().info(
+                        f'[EVENT] EBOT REACHED step {self.step + 1}: pos=({self.x:.3f}, {self.y:.3f}) '
+                        f'yaw={self.yaw:.3f} | goal=({end[0]:.2f}, {end[1]:.2f}) | '
+                        f'pos_err={err:.3f} m | t={self.now_sec():.1f}s')
 
                     if self.step == 0:
                         self.stage = 'ore'

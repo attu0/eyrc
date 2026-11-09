@@ -69,7 +69,7 @@ cam_frame_id = 'camera_color_optical_frame'
 EXPECTED_ORES = 4
 
 # Number of consistent detections needed before an ore position is locked.
-N_SAMPLES = 8
+N_SAMPLES = 4
 
 # Detections of one ore must stay inside this pixel radius to count as the same ore.
 TRACK_RADIUS_PX = 20
@@ -101,7 +101,7 @@ PACKAGE_MIN_AREA = 250                                                          
 PACKAGE_MAX_AREA = 60000
 
 # Seconds the node spends re-detecting one ore when the arm asks for it.
-RESCAN_TIMEOUT_S = 5.0
+RESCAN_TIMEOUT_S = 4.0
 
 
 ##################### FUNCTION DEFINITIONS #######################
@@ -233,7 +233,7 @@ class ore_tf(Node):
             Bool, '/handover/ebot_ready', self.ebotreadycb, latched
         )
 
-        self.timer = self.create_timer(0.1, self.process_image)
+        self.timer = self.create_timer(0.05, self.process_image)
 
         self.cv_image = None
         self.depth_image = None
@@ -527,7 +527,7 @@ class ore_tf(Node):
 
             if not self.package_debug_saved:                                            # camera frame beside the colour mask
                 cv2.imwrite('package_debug.png',
-                            np.hstack([self.cv_image, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)]))
+                            np.hstack([self.cv_image, cv2.cvtColor(mask, cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR))]))
                 self.package_debug_saved = True
 
             return
@@ -543,7 +543,10 @@ class ore_tf(Node):
         if depth is None:
             return
 
-        self.package_samples.append(self.pixel_to_base(center_x, center_y, depth, transform))
+        point = self.pixel_to_base(center_x, center_y, depth, transform)
+        if np.hypot(point[0], point[1]) > 1.1:
+            return
+        self.package_samples.append(point)
 
         if len(self.package_samples) >= N_SAMPLES:
             median = np.median(np.array(self.package_samples), axis=0)
