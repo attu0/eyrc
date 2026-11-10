@@ -8,7 +8,7 @@
 *
 *  This script implements Task 3B ore manipulation for StrataCobot (SC).
 *  It sorts the ores into their containers and moves the ore package into the crusher,
-*  with filtering for noisy force and pose sensors and gentle package descents.
+*  with closed-loop force compliance during VERIFY for 1st-attempt picks.
 *
 *  This software is made available on an "AS IS WHERE IS BASIS".
 *****************************************************************************************
@@ -70,9 +70,9 @@ DROP_POINTS = {
 
 # Ore package (Task 3B).
 PACKAGE_FRAME = 'ore_package'
-PACKAGE_FORCE_MIN_N = 1.85
-PACKAGE_FORCE_MAX_N = 4.40
-PACKAGE_STABLE_RANGE_N = 1.25
+PACKAGE_FORCE_MIN_N = 1.80
+PACKAGE_FORCE_MAX_N = 4.45
+PACKAGE_STABLE_RANGE_N = 1.30
 PACKAGE_CLEAR_LIFT_M = 0.13
 
 CRUSHER_DROP = (-0.7250, 0.0050, 0.3100)
@@ -84,9 +84,11 @@ WAIT_ORES_TIMEOUT_S = 20.0
 IDLE_WAIT_S = 15.0
 
 # Heights above the ore TF.
+# Restored PICK_OFFSET_Z = -0.001 so tool stops at z ~ -0.061 to -0.063 m without crushing the ore.
 HOVER_HEIGHT = 0.09
 APPROACH_HEIGHT = 0.038
-PICK_OFFSET_Z = -0.002
+PICK_OFFSET_Z = -0.001
+PKG_PICK_OFFSET_Z = -0.002
 PICK_Z_TRIES = (0.0, -0.002, 0.002)
 MAX_PICK_ATTEMPTS = 10
 MAX_RETRY_ROUNDS = 2
@@ -95,10 +97,11 @@ SEARCH_OFFSETS = (
     (0.010, 0.0), (-0.010, 0.0), (0.0, 0.010), (0.0, -0.010),
     (0.005, 0.005), (-0.005, -0.005),
 )
-CONTACT_BACKOFF_M = 0.004
+# Must be larger than BACKOFF tolerance (0.0025 m) so backoff actually lifts the tool!
+CONTACT_BACKOFF_M = 0.007
 RESCAN_TIMEOUT_S = 4.5
 REDETECT_TIMEOUT_S = 1.8
-LIFT_HEIGHT = 0.11
+LIFT_HEIGHT = 0.15
 
 PROTECTIVE_STOP_CODES = (20, 21, 22, 23)
 MAX_STOPS_PER_ORE = 2
@@ -119,13 +122,13 @@ unfold_target = {
 unfold_kp = 4.2
 control_rate = 0.03
 
-position_tolerance = 0.0080
-TOL_FINE = 0.016
-TOL_COARSE = 0.032
+position_tolerance = 0.0065
+TOL_FINE = 0.015
+TOL_COARSE = 0.030
 
 TRAVEL_KP, TRAVEL_SPEED = 4.5, 0.148
 APPROACH_KP, APPROACH_SPEED = 4.0, 0.146
-DESCEND_KP, DESCEND_SPEED = 2.8, 0.112
+DESCEND_KP, DESCEND_SPEED = 2.8, 0.105
 LIFT_KP, LIFT_SPEED = 4.5, 0.148
 TRANSPORT_KP, TRANSPORT_MAX_SPEED = 4.5, 0.148
 DROP_KP, DROP_MAX_SPEED = 4.5, 0.148
@@ -140,19 +143,20 @@ MOVE_TIMEOUT_S = 40.0
 
 FORCE_HELD_MIN_N = 0.75
 FORCE_HELD_MAX_N = 2.65
-FORCE_STABLE_RANGE_N = 0.90
-FORCE_STABLE_WINDOW_S = 0.22
-CONTACT_FORCE_N = 4.2
-FORCE_WAIT_S = 1.6
-MAGNET_SETTLE_S = 0.15
+FORCE_STABLE_RANGE_N = 0.95
+FORCE_STABLE_WINDOW_S = 0.20
+CONTACT_FORCE_N = 3.8
+FORCE_WAIT_S = 2.2
+MAGNET_SETTLE_S = 0.14
 DROP_SETTLE_S = 0.04
 
-TRAVEL_Z = 0.20
+# Elevated travel height (0.26 m) clears all container dividers and crusher walls.
+TRAVEL_Z = 0.26
 
-R_CLEAR = 0.25
+R_CLEAR = 0.30
 R_ARC = 0.55
 ARC_STEP_DEG = 35.0
-VIA_RADIUS = 0.38
+VIA_RADIUS = 0.42
 TOL_ARC = 0.055
 
 PAN_SOFT_LIMIT = 5.6
@@ -175,7 +179,7 @@ ANG_MAX_RPS = 0.33
 LEVEL_TOL_RAD = 0.035
 LEVEL_TIMEOUT_S = 8.0
 
-TCP_EMA_ALPHA = 0.55
+TCP_EMA_ALPHA = 0.70
 
 
 def quat_to_matrix(q):
@@ -373,6 +377,18 @@ class arm_task2a(Node):
         msg.header.frame_id = base_frame
         self.twist_pub.publish(msg)
 
+    def publish_vertical_nudge(self, vz):
+        """Publishes a gentle vertical velocity while keeping the tool levelled."""
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = base_frame
+        msg.twist.linear.z = vz
+        wx, wy, wz = self.orientation_rate()
+        msg.twist.angular.x = wx
+        msg.twist.angular.y = wy
+        msg.twist.angular.z = wz
+        self.twist_pub.publish(msg)
+
     def set_phase(self, phase):
         """Changes the current task phase and resets its elapsed-time reference."""
         now = self.now_seconds()
@@ -407,19 +423,13 @@ class arm_task2a(Node):
 
         if phase == 'MAGNET_ON':
             self.get_logger().info(
-                f'[EVENT] PICK  {
-                    self.current_ore} tool_xyz={tool_txt} t={
-                    now:.1f}s')
+                f'[EVENT] PICK  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
         elif phase == 'DROP_RELEASE':
             self.get_logger().info(
-                f'[EVENT] DROP  {
-                    self.current_ore} tool_xyz={tool_txt} t={
-                    now:.1f}s')
+                f'[EVENT] DROP  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
         elif phase == 'LIFT':
             self.get_logger().info(
-                f'[EVENT] LIFT  {
-                    self.current_ore} tool_xyz={tool_txt} t={
-                    now:.1f}s')
+                f'[EVENT] LIFT  {self.current_ore} tool_xyz={tool_txt} t={now:.1f}s')
 
     def phase_elapsed(self):
         """Returns the elapsed time since the current phase began."""
@@ -441,7 +451,7 @@ class arm_task2a(Node):
         magnitude = math.sqrt(vx * vx + vy * vy + vz * vz)
         dist = math.sqrt(error_x ** 2 + error_y ** 2 + error_z ** 2)
 
-        min_speed = 0.055 if dist > 0.010 else 0.020
+        min_speed = 0.050 if dist > 0.008 else 0.020
 
         if magnitude > max_speed or (hold_speed and magnitude > 1e-9):
             scale = max_speed / magnitude
@@ -539,7 +549,8 @@ class arm_task2a(Node):
         return math.hypot(a[0] + t * dx, a[1] + t * dy)
 
     def plan_path_xy(self, start, end):
-        '''XY waypoints (end included) for a level move that keeps clear of the base axis.'''
+        '''XY waypoints (end included) for a level move that keeps clear of the base axis
+        and the ore crusher hopper at (-X, y ~ 0).'''
 
         sx, sy = start
         ex, ey = end
@@ -551,6 +562,12 @@ class arm_task2a(Node):
         length2 = dx * dx + dy * dy
         if length2 < 1e-9:
             return [end]
+
+        if (sy < -0.20 and ey > 0.20) or (sy > 0.20 and ey < -0.20):
+            t_zero = -sy / (ey - sy)
+            x_cross = sx + t_zero * dx
+            if not (-0.43 <= x_cross <= -0.32):
+                return [(-0.38, 0.0), end]
 
         t = max(0.0, min(1.0, -(sx * dx + sy * dy) / length2))
         if math.hypot(sx + t * dx, sy + t * dy) >= R_CLEAR:
@@ -969,7 +986,8 @@ class arm_task2a(Node):
         x, y, z = self.current_ore_position
         ox, oy = self.search_offset()
         extra = PICK_Z_TRIES[self.pick_attempt % len(PICK_Z_TRIES)]
-        return (x + ox, y + oy, z + PICK_OFFSET_Z + extra)
+        offset_z = PKG_PICK_OFFSET_Z if self.current_ore == PACKAGE_FRAME else PICK_OFFSET_Z
+        return (x + ox, y + oy, z + offset_z + extra)
 
     def pick_failed(self):
         """Records a failed pick and schedules a retry or skip sequence."""
@@ -1230,7 +1248,7 @@ class arm_task2a(Node):
                 self.contact_hits >= 2
                 and force is not None
                 and force > limit_force
-                and self.phase_elapsed() > 0.35
+                and self.phase_elapsed() > 0.25
             )
 
             if contact:
@@ -1256,7 +1274,7 @@ class arm_task2a(Node):
             return
 
         if p == 'BACKOFF':
-            if self.go(self.backoff_target, 1.8, 0.04, 0.004):
+            if self.go(self.backoff_target, 2.2, 0.05, 0.0025):
                 self.set_phase('MAGNET_ON')
                 self.request_magnet(True, 'pick')
             return
@@ -1266,8 +1284,6 @@ class arm_task2a(Node):
             return
 
         if p == 'VERIFY':
-            self.stop_twist()
-
             force = self.force_magnitude
             elapsed = self.phase_elapsed()
 
@@ -1277,19 +1293,33 @@ class arm_task2a(Node):
             )
 
             if elapsed >= MAGNET_SETTLE_S and self.force_steady_in_band():
+                self.stop_twist()
                 self.get_logger().info(
                     f'Pick confirmed for {self.current_ore}; force={force:.3f} N'
                 )
                 self.set_phase('LIFT')
                 return
 
-            blocked = (
-                self.contact_hits >= 2
-                and force is not None
-                and force > 2.0 * CONTACT_FORCE_N
-                and elapsed > 0.5
-            )
-            if blocked or elapsed > FORCE_WAIT_S:
+            # Closed-loop compliance while magnet is ON:
+            # 1) If force > high_band, the tool is pressing down on the ore/conveyor:
+            #    gently lift (+0.025 m/s) with the magnet ON so the ore hangs freely in-band!
+            # 2) If force < low_band after 0.22 s, the tool stopped a few mm above the ore:
+            #    gently creep down (-0.018 m/s) with the magnet ON until it snaps on!
+            high_band = PACKAGE_FORCE_MAX_N if self.current_ore == PACKAGE_FRAME else FORCE_HELD_MAX_N
+            low_band = PACKAGE_FORCE_MIN_N if self.current_ore == PACKAGE_FRAME else FORCE_HELD_MIN_N
+
+            if force is not None and elapsed >= MAGNET_SETTLE_S:
+                if force > high_band:
+                    self.publish_vertical_nudge(0.028)
+                elif force < low_band and elapsed < 0.85:
+                    self.publish_vertical_nudge(-0.018)
+                else:
+                    self.stop_twist()
+            else:
+                self.stop_twist()
+
+            if elapsed > FORCE_WAIT_S:
+                self.stop_twist()
                 self.pick_failed()
             return
 

@@ -68,8 +68,8 @@ cam_frame_id = 'camera_color_optical_frame'
 # Total ores on the conveyor.
 EXPECTED_ORES = 4
 
-# Number of consistent detections needed before an ore position is locked.
-N_SAMPLES = 5
+# 8 samples (0.4 s) for rock-solid median outlier rejection against Task 3B depth noise.
+N_SAMPLES = 8
 
 # Detections of one ore must stay inside this pixel radius to count as the same ore.
 TRACK_RADIUS_PX = 24
@@ -88,9 +88,6 @@ ORE_Z_TOL = 0.075
 ORE_MAX_RADIUS = 1.2
 
 # ---- Ore package (Task 3B) ----
-# The package is #f700d7 (hue 154 in OpenCV). Under Task 3B sensor noise, individual pixels
-# scatter in hue/saturation, so we use medianBlur + MORPH_CLOSE to keep the blob intact
-# and accept areas down to 60 px inside the eBot's physical stop zone (+X in base_link).
 PACKAGE_FRAME = 'ore_package'
 PACKAGE_HSV = ((135, 100, 50), (168, 255, 255))
 PACKAGE_MIN_AREA = 60
@@ -105,7 +102,7 @@ RESCAN_TIMEOUT_S = 4.0
 def detect_ores(image):
     '''
     Description:
-        Detects ores in a colour image after Gaussian denoising and returns the
+        Detects ores in a colour image after median + Gaussian denoising and returns the
         centre pixel and type of each detected ore.
 
     Args:
@@ -119,7 +116,8 @@ def detect_ores(image):
     center_ore_list = []
     ore_type_list = []
 
-    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    denoised = cv2.medianBlur(image, 3)
+    blurred = cv2.GaussianBlur(denoised, (5, 5), 0)
     hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
     color_bounds = {
@@ -133,8 +131,8 @@ def detect_ores(image):
     for ore_type, (lower, upper) in color_bounds.items():
 
         mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -150,8 +148,8 @@ def detect_ores(image):
             if moments['m00'] == 0:
                 continue
 
-            center_x = int(moments['m10'] / moments['m00'])
-            center_y = int(moments['m01'] / moments['m00'])
+            center_x = int(round(moments['m10'] / moments['m00']))
+            center_y = int(round(moments['m01'] / moments['m00']))
 
             center_ore_list.append((center_x, center_y))
             ore_type_list.append(ore_type)
@@ -345,16 +343,18 @@ class ore_tf(Node):
         }
         self.get_logger().info(f'Re-detecting {name}.')
 
-    def sample_depth(self, center_x, center_y):
+    def sample_depth(self, center_x, center_y, half_win=3):
         '''
         Description:
-            Trimmed median valid depth in a 9x9 window around a pixel, or None.
+            Trimmed median valid depth in a (2*half_win+1)x(2*half_win+1) window
+            around a pixel. A tighter 5x5 or 7x7 window avoids bleeding off the
+            edges of the ore/package cube into the background surface.
         '''
 
         h, w = self.depth_image.shape[:2]
         patch = self.depth_image[
-            max(center_y - 4, 0):min(center_y + 5, h),
-            max(center_x - 4, 0):min(center_x + 5, w)
+            max(center_y - half_win, 0):min(center_y + half_win + 1, h),
+            max(center_x - half_win, 0):min(center_x + half_win + 1, w)
         ]
 
         valid = patch[np.isfinite(patch) & (patch > 0.0)]
@@ -364,7 +364,7 @@ class ore_tf(Node):
 
         if valid.size >= 4:
             q25, q75 = np.percentile(valid, [25, 75])
-            iqr = max(0.02, q75 - q25)
+            iqr = max(0.015, q75 - q25)
             inliers = valid[(valid >= q25 - 1.5 * iqr) & (valid <= q75 + 1.5 * iqr)]
             if inliers.size > 0:
                 return float(np.median(inliers))
@@ -490,8 +490,6 @@ class ore_tf(Node):
             self.get_logger().warn(f'TF lookup failed: {error}', throttle_duration_sec=2.0)
             return
 
-        # Median blur removes Task 3B salt-and-pepper RGB noise without shrinking the small package blob.
-        # Closing first fuses noisy magenta pixels before a light 2x2 opening removes isolated 1-px specks.
         denoised = cv2.medianBlur(self.cv_image, 3)
         hsv = cv2.cvtColor(denoised, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array(PACKAGE_HSV[0]), np.array(PACKAGE_HSV[1]))
@@ -500,7 +498,6 @@ class ore_tf(Node):
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Sort candidate contours largest-first and pick the largest one inside the eBot's stop region
         candidates = sorted(
             [c for c in contours if PACKAGE_MIN_AREA <= cv2.contourArea(c) <= PACKAGE_MAX_AREA],
             key=cv2.contourArea,
@@ -521,17 +518,17 @@ class ore_tf(Node):
             if moments['m00'] == 0:
                 continue
 
-            center_x = int(moments['m10'] / moments['m00'])
-            center_y = int(moments['m01'] / moments['m00'])
+            center_x = int(round(moments['m10'] / moments['m00']))
+            center_y = int(round(moments['m01'] / moments['m00']))
 
-            depth = self.sample_depth(center_x, center_y)
+            # Tight 5x5 window (half_win=2) on the package top face so depth never bleeds onto the deck below
+            depth = self.sample_depth(center_x, center_y, half_win=2)
             if depth is None:
                 continue
 
             point = self.pixel_to_base(center_x, center_y, depth, transform)
             horiz_r = float(np.hypot(point[0], point[1]))
 
-            # Reject if on the arm's own shoulder singularity column (r < 0.28 m or z > 0.40 m) or out of reach (> 1.15 m)
             if 0.28 <= horiz_r <= 1.15 and point[2] < 0.40:
                 chosen_point = point
                 break
@@ -610,7 +607,7 @@ class ore_tf(Node):
 
         for (center_x, center_y), ore_type in zip(center_ore_list, ore_type_list):
 
-            depth = self.sample_depth(center_x, center_y)
+            depth = self.sample_depth(center_x, center_y, half_win=3)
             if depth is None:
                 continue
 
