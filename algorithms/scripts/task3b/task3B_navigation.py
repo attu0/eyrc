@@ -63,7 +63,8 @@ turn_in_place_below = 0.25      # ... and resumes driving once the error is belo
 ODOM_EMA_ALPHA = 0.45
 
 # Local reactive avoidance parameters for unmapped rocks discovered mid-route
-OBS_FRONT_DIST = 0.52           # start nudging away if a rock is closer than this in the forward cone (m)
+# start nudging away if a rock is closer than this in the forward cone (m)
+OBS_FRONT_DIST = 0.72
 
 
 ##################### CLASS DEFINITION #######################
@@ -122,7 +123,6 @@ class ebot_nav(Node):
 
         self.get_logger().info('Task 3B eBot navigation node started')
 
-
     def pathcb(self, data):
         '''
         Description:    Callback for /ebot_path. Every new path replaces the current one.
@@ -149,7 +149,6 @@ class ebot_nav(Node):
 
         except Exception as error:
             self.get_logger().error(f'Path callback error: {error}')
-
 
     def odomcb(self, data):
         '''
@@ -180,14 +179,12 @@ class ebot_nav(Node):
         except Exception as error:
             self.get_logger().error(f'Odometry callback error: {error}')
 
-
     def scancb(self, data):
         '''
         Description:    Stores the latest LaserScan message for reactive obstacle skirting.
         '''
 
         self.scan = data
-
 
     def wrap_angle(self, angle):
         '''
@@ -196,14 +193,12 @@ class ebot_nav(Node):
 
         return math.atan2(math.sin(angle), math.cos(angle))
 
-
     def clamp(self, value, low, high):
         '''
         Description:    Limits 'value' to the range [low, high].
         '''
 
         return max(low, min(high, value))
-
 
     def nearest_index(self):
         '''
@@ -221,7 +216,6 @@ class ebot_nav(Node):
 
         return best
 
-
     def lookahead_point(self):
         '''
         Description:    The point on the route 'lookahead_dist' ahead of the eBot's progress.
@@ -237,7 +231,6 @@ class ebot_nav(Node):
 
         return self.route[-1]
 
-
     def avoid_obstacle_steer(self, desired_heading_err, dist_end):
         '''
         Description:    Checks the forward LiDAR sectors. If an unmapped rock lies close to the
@@ -245,7 +238,7 @@ class ebot_nav(Node):
                         steering nudge and speed scale to skirt cleanly around it.
         '''
 
-        if self.scan is None or dist_end < 0.85:
+        if self.scan is None or dist_end < 0.60:
             return desired_heading_err, 1.0
 
         ranges = self.scan.ranges
@@ -255,34 +248,47 @@ class ebot_nav(Node):
 
         min_front = 10.0
         repulse = 0.0
+        left_free = 0.0
+        right_free = 0.0
 
         for i in range(0, n, 2):
             r = ranges[i]
-            if not math.isfinite(r) or r < 0.22 or r > OBS_FRONT_DIST:
+            if not math.isfinite(r) or r < 0.21:
                 continue
-            if i + 1 < n and abs(ranges[i + 1] - r) > 0.14:
-                continue
-
             ang = amin + i * ainc
-            if abs(ang) > 0.95:
+            if abs(ang) > 1.15:
                 continue
 
-            if abs(ang - desired_heading_err) < 0.40 and r < min_front:
+            if ang >= 0.0:
+                left_free += min(r, 2.0)
+            else:
+                right_free += min(r, 2.0)
+
+            if r > OBS_FRONT_DIST:
+                continue
+            if i + 1 < n and abs(ranges[i + 1] - r) > 0.15:
+                continue
+
+            if abs(ang) < 0.50 and r < min_front:
                 min_front = r
 
-            weight = max(0.0, (OBS_FRONT_DIST - r) / OBS_FRONT_DIST) * math.cos(ang * 0.85)
+            weight = ((OBS_FRONT_DIST - r) / OBS_FRONT_DIST) ** 1.5 * math.cos(ang * 0.75)
             if ang >= 0.0:
-                repulse -= weight * 0.32
+                repulse -= weight * 0.62
             else:
-                repulse += weight * 0.32
+                repulse += weight * 0.62
 
         if min_front >= OBS_FRONT_DIST:
             return desired_heading_err, 1.0
 
-        adjusted = self.clamp(desired_heading_err + repulse, -1.10, 1.10)
-        speed_scale = self.clamp((min_front - 0.24) / (OBS_FRONT_DIST - 0.24), 0.45, 1.0)
-        return adjusted, speed_scale
+        # If an obstacle is dead-ahead (< 0.42 m) and left/right repulsion
+        # cancelled out, force a turn toward the clearer side
+        if min_front < 0.42 and abs(repulse) < 0.25:
+            repulse = 0.65 if left_free >= right_free else -0.65
 
+        adjusted = self.clamp(desired_heading_err + repulse, -1.30, 1.30)
+        speed_scale = self.clamp((min_front - 0.26) / (OBS_FRONT_DIST - 0.26), 0.30, 1.0)
+        return adjusted, speed_scale
 
     def process_navigation(self):
         '''
@@ -292,7 +298,9 @@ class ebot_nav(Node):
         try:
             if self.route is None or self.odom is None or self.phase == 'idle':
                 self.get_logger().info(
-                    f'Waiting: path received={self.route is not None}, odom received={self.odom is not None}',
+                    f'Waiting: path received={
+                        self.route is not None}, odom received={
+                        self.odom is not None}',
                     throttle_duration_sec=3.0)
                 return
 
@@ -306,7 +314,8 @@ class ebot_nav(Node):
             ##################### BIDIRECTIONAL CREEP CORRECTION #####################
 
             if self.phase == 'creep':
-                # Drive forward or backward (whichever requires < 90 deg turn) directly to (end_x, end_y)
+                # Drive forward or backward (whichever requires < 90 deg turn) directly to
+                # (end_x, end_y)
                 dx = end_x - self.x
                 dy = end_y - self.y
                 if dist_end < finish_dist:
@@ -372,8 +381,10 @@ class ebot_nav(Node):
             raw_heading_error = self.wrap_angle(
                 math.atan2(target_y - self.y, target_x - self.x) - self.yaw)
 
-            # Arrived: within finish_dist (0.09 m), or actively tracking and just passed the end point (< 0.13 m)
-            if dist_end < finish_dist or (self.phase == 'track' and dist_end < 0.13 and abs(raw_heading_error) > 1.50):
+            # Arrived: within finish_dist (0.09 m), or actively tracking and just
+            # passed the end point (< 0.13 m)
+            if dist_end < finish_dist or (
+                    self.phase == 'track' and dist_end < 0.13 and abs(raw_heading_error) > 1.50):
                 self.phase = 'align'
                 self.stop_robot()
                 return
@@ -409,7 +420,6 @@ class ebot_nav(Node):
         except Exception as error:
             self.get_logger().error(f'Navigation error: {error}')
             self.stop_robot()
-
 
     def stop_robot(self):
         '''

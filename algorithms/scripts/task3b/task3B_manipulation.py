@@ -84,7 +84,6 @@ WAIT_ORES_TIMEOUT_S = 20.0
 IDLE_WAIT_S = 15.0
 
 # Heights above the ore TF.
-# Restored PICK_OFFSET_Z = -0.001 so tool stops at z ~ -0.061 to -0.063 m without crushing the ore.
 HOVER_HEIGHT = 0.09
 APPROACH_HEIGHT = 0.038
 PICK_OFFSET_Z = -0.001
@@ -97,11 +96,10 @@ SEARCH_OFFSETS = (
     (0.010, 0.0), (-0.010, 0.0), (0.0, 0.010), (0.0, -0.010),
     (0.005, 0.005), (-0.005, -0.005),
 )
-# Must be larger than BACKOFF tolerance (0.0025 m) so backoff actually lifts the tool!
 CONTACT_BACKOFF_M = 0.007
 RESCAN_TIMEOUT_S = 4.5
 REDETECT_TIMEOUT_S = 1.8
-LIFT_HEIGHT = 0.15
+LIFT_HEIGHT = 0.12
 
 PROTECTIVE_STOP_CODES = (20, 21, 22, 23)
 MAX_STOPS_PER_ORE = 2
@@ -145,18 +143,18 @@ FORCE_HELD_MIN_N = 0.75
 FORCE_HELD_MAX_N = 2.65
 FORCE_STABLE_RANGE_N = 0.95
 FORCE_STABLE_WINDOW_S = 0.20
-CONTACT_FORCE_N = 3.8
+CONTACT_FORCE_N = 3.2
 FORCE_WAIT_S = 2.2
 MAGNET_SETTLE_S = 0.14
 DROP_SETTLE_S = 0.04
 
-# Elevated travel height (0.26 m) clears all container dividers and crusher walls.
-TRAVEL_Z = 0.26
+# Keep TRAVEL_Z at 0.21 m so distant conveyor ores (r ~ 0.80 m) never over-stretch the elbow!
+TRAVEL_Z = 0.21
 
-R_CLEAR = 0.30
-R_ARC = 0.55
+R_CLEAR = 0.27
+R_ARC = 0.54
 ARC_STEP_DEG = 35.0
-VIA_RADIUS = 0.42
+VIA_RADIUS = 0.39
 TOL_ARC = 0.055
 
 PAN_SOFT_LIMIT = 5.6
@@ -169,7 +167,8 @@ JOINT_LIMITS = {
     'wrist_2_joint': 6.2832,
     'wrist_3_joint': 6.2832,
 }
-DROP_APPROACH_HEIGHT = 0.025
+# Extra clearance at the containers (0.175 + 0.055 = 0.23 m) so vanadinite_ore clears the container rim
+DROP_APPROACH_HEIGHT = 0.055
 
 DROP_ORES_FROM_HEIGHT = True
 DROP_PACKAGE_FROM_HEIGHT = True
@@ -550,7 +549,7 @@ class arm_task2a(Node):
 
     def plan_path_xy(self, start, end):
         '''XY waypoints (end included) for a level move that keeps clear of the base axis
-        and the ore crusher hopper at (-X, y ~ 0).'''
+        and avoids cutting across the crusher hopper at x < -0.45 when crossing y = 0.'''
 
         sx, sy = start
         ex, ey = end
@@ -563,14 +562,16 @@ class arm_task2a(Node):
         if length2 < 1e-9:
             return [end]
 
+        # Check if the straight line crosses y = 0 too far out into the crusher box (x < -0.45)
+        clips_crusher = False
         if (sy < -0.20 and ey > 0.20) or (sy > 0.20 and ey < -0.20):
             t_zero = -sy / (ey - sy)
             x_cross = sx + t_zero * dx
-            if not (-0.43 <= x_cross <= -0.32):
-                return [(-0.38, 0.0), end]
+            if x_cross < -0.45:
+                clips_crusher = True
 
         t = max(0.0, min(1.0, -(sx * dx + sy * dy) / length2))
-        if math.hypot(sx + t * dx, sy + t * dy) >= R_CLEAR:
+        if math.hypot(sx + t * dx, sy + t * dy) >= R_CLEAR and not clips_crusher:
             return [end]
 
         theta_s = math.atan2(sy, sx)
@@ -1300,19 +1301,14 @@ class arm_task2a(Node):
                 self.set_phase('LIFT')
                 return
 
-            # Closed-loop compliance while magnet is ON:
-            # 1) If force > high_band, the tool is pressing down on the ore/conveyor:
-            #    gently lift (+0.025 m/s) with the magnet ON so the ore hangs freely in-band!
-            # 2) If force < low_band after 0.22 s, the tool stopped a few mm above the ore:
-            #    gently creep down (-0.018 m/s) with the magnet ON until it snaps on!
             high_band = PACKAGE_FORCE_MAX_N if self.current_ore == PACKAGE_FRAME else FORCE_HELD_MAX_N
-            low_band = PACKAGE_FORCE_MIN_N if self.current_ore == PACKAGE_FRAME else FORCE_HELD_MIN_N
 
             if force is not None and elapsed >= MAGNET_SETTLE_S:
                 if force > high_band:
-                    self.publish_vertical_nudge(0.028)
-                elif force < low_band and elapsed < 0.85:
-                    self.publish_vertical_nudge(-0.018)
+                    self.publish_vertical_nudge(0.025)
+                elif (force < 0.35 and elapsed < 0.35
+                      and self.tcp_pose.position.z > self.current_ore_position[2] - 0.002):
+                    self.publish_vertical_nudge(-0.015)
                 else:
                     self.stop_twist()
             else:

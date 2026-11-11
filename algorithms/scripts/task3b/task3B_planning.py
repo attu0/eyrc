@@ -21,12 +21,12 @@
 # Author List:		[ Atharv Mudse, Abhay Potdar, Riddhi Wagh, Yash Waje ]
 # Filename:		    task3B_planning.py
 # Functions:
-#			        [ mapcb, odomcb, scancb, world_to_cell, cell_to_world,
+# [ mapcb, odomcb, scancb, world_to_cell, cell_to_world,
 #                     compute_clearance, cell_free, point_free, segment_free, astar, shortcut,
 #                     densify, plan_path, publish_path, request_ore_package, taken_cb,
 #                     end_reached, process_planning, main ]
 # Nodes:		    ebot_planner_node
-#			        Publishing Topics  - [ /ebot_path, /handover/ebot_ready ]
+# Publishing Topics  - [ /ebot_path, /handover/ebot_ready ]
 #                   Subscribing Topics - [ /map, /odom, /scan, /handover/package_taken ]
 #                   Service Clients    - [ /spawn_ore_package ]
 
@@ -86,10 +86,10 @@ end_yaw_options = [
 
 ##################### PLANNER TUNING #######################
 
-clearance_levels = (0.31, 0.28, 0.24, 0.21)
+clearance_levels = (0.32, 0.29, 0.25, 0.22)
 
-soft_margin = 0.30
-soft_weight = 0.0
+soft_margin = 0.35
+soft_weight = 0.40
 
 endpoint_exempt = 0.38
 path_spacing = 0.25
@@ -193,14 +193,12 @@ class ebot_planner(Node):
         self.settle_until = 0.0
         self.package_taken = False
 
-
     def now_sec(self):
         '''
         Description:    Current (simulation) time in seconds.
         '''
 
         return self.get_clock().now().nanoseconds * 1e-9
-
 
     def is_still(self):
         '''
@@ -221,7 +219,6 @@ class ebot_planner(Node):
                 return True
 
         return False
-
 
     def mapcb(self, data):
         '''
@@ -264,7 +261,6 @@ class ebot_planner(Node):
         except Exception as error:
             self.get_logger().error(f'Map callback error: {error}')
 
-
     def odomcb(self, data):
         '''
         Description:    Callback function for the odometry topic with EMA noise filtering.
@@ -298,7 +294,8 @@ class ebot_planner(Node):
 
             now = self.now_sec()
             self.pose_hist.append((now, self.x, self.y, self.yaw))
-            self.pose_hist = [(t, px, py, pyaw) for t, px, py, pyaw in self.pose_hist if now - t <= 0.45]
+            self.pose_hist = [(t, px, py, pyaw)
+                              for t, px, py, pyaw in self.pose_hist if now - t <= 0.45]
 
             if self.lin_speed < still_lin and self.ang_speed < still_ang:
                 if self.still_since is None:
@@ -310,7 +307,6 @@ class ebot_planner(Node):
 
         except Exception as error:
             self.get_logger().error(f'Odometry callback error: {error}')
-
 
     def scancb(self, msg):
         '''
@@ -330,7 +326,7 @@ class ebot_planner(Node):
             angle = msg.angle_min
             inc = msg.angle_increment
             rmin = max(0.25, msg.range_min)
-            rmax = min(5.5, msg.range_max)
+            rmax = min(6.5, msg.range_max)
             w = self.width
             changed = False
 
@@ -359,8 +355,8 @@ class ebot_planner(Node):
                                 changed = True
                     d += step_d
 
-                if hit and r < 4.5:
-                    if i + 1 < len(msg.ranges) and abs(msg.ranges[i + 1] - r) > 0.18:
+                if hit and r < 6.0:
+                    if i + 1 < len(msg.ranges) and abs(msg.ranges[i + 1] - r) > 0.16:
                         continue
 
                     hx = rx + r * c_cos
@@ -368,7 +364,8 @@ class ebot_planner(Node):
 
                     if math.hypot(hx - ARM_STRUCT_X, hy - ARM_STRUCT_Y) < ARM_STRUCT_R:
                         continue
-                    if any(math.hypot(hx - gx, hy - gy) < 0.35 for gx, gy, _ in (home_pose, ore_drop_pose, arm_pose)):
+                    if any(math.hypot(hx - gx, hy - gy) < 0.35 for gx,
+                           gy, _ in (home_pose, ore_drop_pose, arm_pose)):
                         continue
 
                     cell = self.world_to_cell(hx, hy)
@@ -376,7 +373,7 @@ class ebot_planner(Node):
                         idx = cell[1] * w + cell[0]
                         if self.scan_votes[idx] < 6:
                             self.scan_votes[idx] += 2
-                        if not self.occ[idx] and self.scan_votes[idx] >= 3:
+                        if not self.occ[idx] and self.scan_votes[idx] >= 2:
                             self.occ[idx] = True
                             changed = True
 
@@ -385,7 +382,6 @@ class ebot_planner(Node):
 
         except Exception as error:
             self.get_logger().error(f'Scan callback error: {error}')
-
 
     ##################### GRID HELPERS #######################
 
@@ -402,7 +398,6 @@ class ebot_planner(Node):
 
         return None
 
-
     def cell_to_world(self, col, row):
         '''
         Description:    Centre of a cell in map coordinates.
@@ -410,7 +405,6 @@ class ebot_planner(Node):
 
         return (self.origin_x + (col + 0.5) * self.res,
                 self.origin_y + (row + 0.5) * self.res)
-
 
     def compute_clearance(self):
         '''
@@ -458,7 +452,6 @@ class ebot_planner(Node):
         half = 0.5 * self.res
         return [max(0.0, math.sqrt(v) * self.res - half) if v < big else 1e6 for v in grid]
 
-
     def cell_free(self, col, row, hard_r, ends):
         '''
         Description:    Whether the eBot's centre may stand in this cell.
@@ -478,7 +471,6 @@ class ebot_planner(Node):
         cx, cy = self.cell_to_world(col, row)
         return any(math.hypot(cx - ex, cy - ey) < endpoint_exempt for ex, ey in ends)
 
-
     def point_free(self, x, y, hard_r, ends):
         '''
         Description:    cell_free() for a position in metres.
@@ -486,7 +478,6 @@ class ebot_planner(Node):
 
         cell = self.world_to_cell(x, y)
         return cell is not None and self.cell_free(cell[0], cell[1], hard_r, ends)
-
 
     def segment_free(self, p, q, hard_r, ends):
         '''
@@ -498,11 +489,11 @@ class ebot_planner(Node):
 
         for i in range(n + 1):
             t = i / n
-            if not self.point_free(p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]), hard_r, ends):
+            if not self.point_free(p[0] + t * (q[0] - p[0]), p[1] +
+                                   t * (q[1] - p[1]), hard_r, ends):
                 return False
 
         return True
-
 
     ##################### SEARCH #######################
 
@@ -571,7 +562,6 @@ class ebot_planner(Node):
 
         return None
 
-
     def shortcut(self, pts, hard_r, ends):
         '''
         Description:    Thins out a cell path via line-of-sight shortcutting.
@@ -596,7 +586,6 @@ class ebot_planner(Node):
 
         return forward if length(forward) <= length(backward) else backward
 
-
     def densify(self, pts):
         '''
         Description:    Adds points along each straight segment so poses are at most
@@ -615,7 +604,6 @@ class ebot_planner(Node):
         out[-1] = pts[-1]
 
         return out
-
 
     def plan_path(self, start, end):
         '''
@@ -658,7 +646,6 @@ class ebot_planner(Node):
 
         return points
 
-
     def publish_path(self, points, start, end):
         '''
         Description:    Publishes 'points' on /ebot_path as a nav_msgs/Path.
@@ -691,10 +678,13 @@ class ebot_planner(Node):
 
         self.path_pub.publish(path)
         self.get_logger().info(
-            f'[EVENT] EBOT PATH step {self.step + 1}: start=({points[0][0]:.2f}, {points[0][1]:.2f}) '
+            f'[EVENT] EBOT PATH step {
+                self.step +
+                1}: start=({
+                points[0][0]:.2f}, {
+                points[0][1]:.2f}) '
             f'end=({points[-1][0]:.2f}, {points[-1][1]:.2f}) t={self.now_sec():.1f}s')
         self.get_logger().info(f'Published path for step {self.step + 1} ({len(points)} poses)')
-
 
     def request_ore_package(self):
         '''
@@ -710,7 +700,6 @@ class ebot_planner(Node):
         future = self.spawn_client.call_async(Trigger.Request())
         future.add_done_callback(self.ore_reply)
 
-
     def ore_reply(self, future):
         '''
         Description:    Handles the reply of /spawn_ore_package.
@@ -718,7 +707,10 @@ class ebot_planner(Node):
 
         try:
             result = future.result()
-            self.get_logger().info(f'Ore package reply: success={result.success}, message="{result.message}"')
+            self.get_logger().info(
+                f'Ore package reply: success={
+                    result.success}, message="{
+                    result.message}"')
 
             if result.success:
                 self.ore_done = True
@@ -732,7 +724,6 @@ class ebot_planner(Node):
         finally:
             self.ore_pending = False
 
-
     def taken_cb(self, msg):
         '''
         Description:    Callback for /handover/package_taken: the arm has lifted the package off the deck.
@@ -740,7 +731,6 @@ class ebot_planner(Node):
 
         if msg.data:
             self.package_taken = True
-
 
     def end_reached(self, end, options):
         '''
@@ -756,7 +746,6 @@ class ebot_planner(Node):
 
         return self.is_still()
 
-
     def process_planning(self):
         '''
         Description:    Timer function used to plan, publish and request, step by step.
@@ -765,7 +754,9 @@ class ebot_planner(Node):
         try:
             if self.grid is None or self.odom is None:
                 self.get_logger().info(
-                    f'Waiting for map ({self.grid is not None}) and odometry ({self.odom is not None})',
+                    f'Waiting for map ({
+                        self.grid is not None}) and odometry ({
+                        self.odom is not None})',
                     throttle_duration_sec=3.0)
                 return
 
@@ -807,7 +798,11 @@ class ebot_planner(Node):
                     self.get_logger().info(f'Step {self.step + 1} finished')
                     err = math.hypot(self.x - end[0], self.y - end[1])
                     self.get_logger().info(
-                        f'[EVENT] EBOT REACHED step {self.step + 1}: pos=({self.x:.3f}, {self.y:.3f}) '
+                        f'[EVENT] EBOT REACHED step {
+                            self.step +
+                            1}: pos=({
+                            self.x:.3f}, {
+                            self.y:.3f}) '
                         f'yaw={self.yaw:.3f} | goal=({end[0]:.2f}, {end[1]:.2f}) | '
                         f'pos_err={err:.3f} m | t={self.now_sec():.1f}s')
 
